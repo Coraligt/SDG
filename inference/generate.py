@@ -1,0 +1,397 @@
+# inference/generate.py
+
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import h5py
+import json
+from typing import Dict, List, Optional, Tuple
+import logging
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+from models.fe_surrogate import FerroelectricSurrogate
+from ferroelectric_dataset import FerroelectricDataset
+
+
+class SyntheticDataGenerator:
+    """Generate synthetic ferroelectric degradation data using trained surrogate."""
+    
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = 'cuda',
+        normalize: bool = True
+    ):
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.normalize = normalize
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        # Load checkpoint
+        self.logger.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.config = checkpoint['config']
+        
+        # Create model
+        self.model = self._create_model()
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Load normalization stats if needed
+        if normalize:
+            self._load_normalization_stats()
+            
+        self.logger.info("Model loaded successfully")
+        
+    def _create_model(self) -> FerroelectricSurrogate:
+        """Create model from config."""
+        model_config = self.config['model']
+        return FerroelectricSurrogate(
+            trap_dim=model_config['trap_dim'],
+            state_dim=model_config['state_dim'],
+            latent_dim=model_config['latent_dim'],
+            hidden_dim=model_config['hidden_dim'],
+            encoder_layers=model_config['encoder_layers'],
+            evolution_layers=model_config['evolution_layers'],
+            breakdown_threshold=model_config['breakdown_threshold'],
+            use_fno=model_config.get('use_fno', False)
+        )
+        
+    def _load_normalization_stats(self):
+        """Load normalization statistics from training data."""
+        # Create a dummy dataset to get normalization stats
+        dataset = FerroelectricDataset(
+            data_path=self.config['data']['csv_path'],
+            train=True,
+            normalize=True
+        )
+        
+        self.trap_mean = torch.tensor(dataset.trap_mean, device=self.device)
+        self.trap_std = torch.tensor(dataset.trap_std, device=self.device)
+        self.voltage_mean = dataset.voltage_mean
+        self.voltage_std = dataset.voltage_std
+        self.cycle_mean = dataset.cycle_mean
+        self.cycle_std = dataset.cycle_std
+        self.thickness_mean = dataset.thickness_mean
+        self.thickness_std = dataset.thickness_std
+        self.pulsewidth_mean = dataset.pulsewidth_mean
+        self.pulsewidth_std = dataset.pulsewidth_std
+        
+    def generate_samples(
+        self,
+        num_samples: int,
+        voltage_range: Tuple[float, float] = (-3.6, 3.6),
+        thickness: float = 6e-9,
+        pulsewidth: float = 2e-7,
+        initial_cycles: int = 5,
+        max_cycles: int = 2000,
+        seed: Optional[int] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Generate synthetic samples with random trap parameters.
+        
+        Args:
+            num_samples: Number of samples to generate
+            voltage_range: Range of voltages to sample from
+            thickness: Film thickness (m)
+            pulsewidth: Pulse width (s)
+            initial_cycles: Number of initial cycles to simulate
+            max_cycles: Maximum cycles to generate
+            seed: Random seed
+            
+        Returns:
+            Dictionary containing generated data
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            
+        # Generate random trap parameters
+        trap_params = self._generate_trap_parameters(num_samples)
+        
+        # Generate random voltages
+        voltages = np.random.uniform(voltage_range[0], voltage_range[1], num_samples)
+        
+        # Generate initial states
+        initial_states = self._generate_initial_states(
+            num_samples, initial_cycles, trap_params, voltages
+        )
+        
+        # Convert to tensors
+        trap_params_tensor = torch.tensor(trap_params, dtype=torch.float32, device=self.device)
+        voltages_tensor = torch.tensor(voltages, dtype=torch.float32, device=self.device)
+        thickness_tensor = torch.full((num_samples,), thickness, device=self.device)
+        pulsewidth_tensor = torch.full((num_samples,), pulsewidth, device=self.device)
+        initial_states_tensor = torch.tensor(initial_states, dtype=torch.float32, device=self.device)
+        
+        # Normalize if needed
+        if self.normalize:
+            trap_params_tensor = (trap_params_tensor - self.trap_mean) / self.trap_std
+            voltages_tensor = (voltages_tensor - self.voltage_mean) / self.voltage_std
+            thickness_tensor = (thickness_tensor - self.thickness_mean) / self.thickness_std
+            pulsewidth_tensor = (pulsewidth_tensor - self.pulsewidth_mean) / self.pulsewidth_std
+            initial_states_tensor = (initial_states_tensor - self.cycle_mean) / self.cycle_std
+            
+        # Generate trajectories
+        self.logger.info(f"Generating {num_samples} synthetic trajectories...")
+        
+        with torch.no_grad():
+            results = self.model.generate(
+                trap_params=trap_params_tensor,
+                voltage=voltages_tensor,
+                thickness=thickness_tensor,
+                pulsewidth=pulsewidth_tensor,
+                initial_states=initial_states_tensor,
+                max_cycles=max_cycles - initial_cycles
+            )
+            
+        # Denormalize results if needed
+        if self.normalize:
+            results['full_trajectory'] = (
+                results['full_trajectory'] * self.cycle_std + self.cycle_mean
+            )
+            
+        # Convert to numpy
+        return {
+            'trap_parameters': trap_params,
+            'voltages': voltages,
+            'thickness': np.full(num_samples, thickness),
+            'pulsewidth': np.full(num_samples, pulsewidth),
+            'trajectories': results['full_trajectory'].cpu().numpy(),
+            'breakdown_cycles': results['breakdown_cycles'].cpu().numpy(),
+            'final_defect_counts': results['final_defect_counts'].cpu().numpy()
+        }
+        
+    def _generate_trap_parameters(self, num_samples: int) -> np.ndarray:
+        """Generate realistic trap parameters based on physical ranges."""
+        # Define parameter ranges (based on the data exploration)
+        param_ranges = {
+            'peak_density': (1e19, 5e19),  # cm^-3
+            'thermal_ionization_mean': (2.0, 3.0),  # eV
+            'thermal_ionization_spread': (0.5, 1.5),  # eV
+            'relaxation_energy': (1.0, 1.5),  # eV
+            'electron_affinity': (2.4, 2.4),  # Fixed
+            'work_function_te': (4.6, 4.6),  # Fixed
+            'work_function_be': (4.6, 4.6),  # Fixed
+            'bandgap': (5.8, 5.8)  # Fixed
+        }
+        
+        trap_params = np.zeros((num_samples, 8))
+        
+        for i, (param, (low, high)) in enumerate(param_ranges.items()):
+            if low == high:
+                trap_params[:, i] = low
+            else:
+                trap_params[:, i] = np.random.uniform(low, high, num_samples)
+                
+        return trap_params
+        
+    def _generate_initial_states(
+        self,
+        num_samples: int,
+        initial_cycles: int,
+        trap_params: np.ndarray,
+        voltages: np.ndarray
+    ) -> np.ndarray:
+        """Generate realistic initial states based on physics."""
+        initial_states = np.zeros((num_samples, initial_cycles))
+        
+        for i in range(num_samples):
+            # Simple model: initial defect growth proportional to voltage and trap density
+            base_rate = 0.1 * np.abs(voltages[i]) * (trap_params[i, 0] / 1e19)
+            
+            for j in range(initial_cycles):
+                if j == 0:
+                    initial_states[i, j] = np.random.poisson(10)  # Start with some defects
+                else:
+                    # Exponential growth model
+                    growth = np.random.poisson(base_rate * j)
+                    initial_states[i, j] = initial_states[i, j-1] + growth
+                    
+        return initial_states
+        
+    def save_dataset(
+        self,
+        data: Dict[str, np.ndarray],
+        output_dir: str,
+        format: str = 'hdf5'
+    ):
+        """Save generated dataset."""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        if format == 'hdf5':
+            # Save as HDF5
+            with h5py.File(output_path / 'synthetic_data.h5', 'w') as f:
+                for key, value in data.items():
+                    f.create_dataset(key, data=value, compression='gzip')
+                    
+            # Save metadata
+            metadata = {
+                'num_samples': len(data['voltages']),
+                'generation_config': {
+                    'model_checkpoint': str(self.config),
+                    'breakdown_threshold': self.config['model']['breakdown_threshold']
+                }
+            }
+            
+            with open(output_path / 'metadata.json', 'w') as f:
+                json.dump(metadata, f, indent=2)
+                
+        elif format == 'csv':
+            # Convert to CSV format similar to original
+            num_samples = len(data['voltages'])
+            max_cycles = data['trajectories'].shape[1]
+            
+            # Create dataframe
+            df_data = []
+            
+            for i in range(num_samples):
+                row = []
+                # Add trap parameters
+                row.extend(data['trap_parameters'][i, :4])  # Only first 4 (others are fixed)
+                # Add voltage
+                row.append(data['voltages'][i])
+                row.append(-data['voltages'][i])  # Voltage 2 (symmetric)
+                # Add pulsewidth and thickness
+                row.append(data['pulsewidth'][i])
+                row.append(data['thickness'][i])
+                # Add trajectory
+                trajectory = data['trajectories'][i]
+                # Pad with NaN after breakdown
+                breakdown_idx = data['breakdown_cycles'][i]
+                if breakdown_idx < max_cycles:
+                    trajectory[breakdown_idx:] = np.nan
+                row.extend(trajectory)
+                
+                df_data.append(row)
+                
+            df = pd.DataFrame(df_data)
+            df.to_csv(output_path / 'synthetic_data.csv', index=False, header=False)
+            
+        self.logger.info(f"Saved {len(data['voltages'])} samples to {output_path}")
+        
+    def visualize_samples(
+        self,
+        data: Dict[str, np.ndarray],
+        num_samples: int = 5,
+        save_path: Optional[str] = None
+    ):
+        """Visualize generated samples."""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Plot 1: Sample trajectories
+        ax = axes[0, 0]
+        for i in range(min(num_samples, len(data['trajectories']))):
+            trajectory = data['trajectories'][i]
+            breakdown_cycle = data['breakdown_cycles'][i]
+            
+            # Plot until breakdown
+            cycles = np.arange(len(trajectory))
+            valid_mask = cycles < breakdown_cycle
+            
+            ax.plot(cycles[valid_mask], trajectory[valid_mask], 
+                   label=f"V={data['voltages'][i]:.1f}V", alpha=0.7)
+            ax.scatter(breakdown_cycle, trajectory[breakdown_cycle-1], 
+                      marker='x', s=100, c='red')
+            
+        ax.set_xlabel('Cycles')
+        ax.set_ylabel('Defect Count')
+        ax.set_title('Sample Trajectories')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 2: Breakdown cycles vs voltage
+        ax = axes[0, 1]
+        ax.scatter(data['voltages'], data['breakdown_cycles'], alpha=0.6)
+        ax.set_xlabel('Voltage (V)')
+        ax.set_ylabel('Breakdown Cycle')
+        ax.set_title('Voltage Dependence of Breakdown')
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 3: Final defect count distribution
+        ax = axes[1, 0]
+        ax.hist(data['final_defect_counts'], bins=30, alpha=0.7, edgecolor='black')
+        ax.axvline(200, color='red', linestyle='--', label='Threshold')
+        ax.set_xlabel('Final Defect Count')
+        ax.set_ylabel('Count')
+        ax.set_title('Distribution of Final Defect Counts')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 4: Trap parameter correlation
+        ax = axes[1, 1]
+        ax.scatter(data['trap_parameters'][:, 0] / 1e19, 
+                  data['breakdown_cycles'], alpha=0.6)
+        ax.set_xlabel('Peak Density (×10¹⁹ cm⁻³)')
+        ax.set_ylabel('Breakdown Cycle')
+        ax.set_title('Effect of Initial Trap Density')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            self.logger.info(f"Saved visualization to {save_path}")
+        else:
+            plt.show()
+            
+        plt.close()
+
+
+def main():
+    """Main generation script."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Generate synthetic ferroelectric data')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                       help='Path to model checkpoint')
+    parser.add_argument('--num_samples', type=int, default=1000,
+                       help='Number of samples to generate')
+    parser.add_argument('--output_dir', type=str, default='synthetic_data',
+                       help='Output directory')
+    parser.add_argument('--voltage_min', type=float, default=-3.6,
+                       help='Minimum voltage')
+    parser.add_argument('--voltage_max', type=float, default=3.6,
+                       help='Maximum voltage')
+    parser.add_argument('--format', type=str, default='hdf5',
+                       choices=['hdf5', 'csv'],
+                       help='Output format')
+    parser.add_argument('--visualize', action='store_true',
+                       help='Create visualizations')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed')
+    
+    args = parser.parse_args()
+    
+    # Create generator
+    generator = SyntheticDataGenerator(args.checkpoint)
+    
+    # Generate samples
+    data = generator.generate_samples(
+        num_samples=args.num_samples,
+        voltage_range=(args.voltage_min, args.voltage_max),
+        seed=args.seed
+    )
+    
+    # Save dataset
+    generator.save_dataset(data, args.output_dir, format=args.format)
+    
+    # Visualize if requested
+    if args.visualize:
+        viz_path = Path(args.output_dir) / 'sample_visualization.png'
+        generator.visualize_samples(data, save_path=str(viz_path))
+        
+    print(f"\nGeneration complete!")
+    print(f"Generated {args.num_samples} samples")
+    print(f"Average breakdown cycle: {data['breakdown_cycles'].mean():.1f} ± {data['breakdown_cycles'].std():.1f}")
+    print(f"Saved to {args.output_dir}")
+
+
+if __name__ == '__main__':
+    main()

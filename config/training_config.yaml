@@ -13,7 +13,7 @@ model:
 
 # Data configuration
 data:
-  csv_path: "data/raw/kmc_run1_6nm_80dev_1.csv"
+  csv_path: "data/kmc_run1_6nm_80dev_1.csv"
   initial_cycles: 5
   prediction_horizon: 50
   max_cycles: 2000

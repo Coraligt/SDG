@@ -6,12 +6,11 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, List
 import numpy as np
 
-# PhysicsNeMo imports
+# PhysicsNeMo imports 
 from physicsnemo.models.mlp import FullyConnected
-from physicsnemo.models.rnn import RNN
-from physicsnemo.models.fno import FNO1d
 from physicsnemo.models.embeddings import SinusoidalEmbedding
-
+# from physicsnemo.models.rnn import RNN
+from physicsnemo.models.fno import FNO1d
 
 class TrapParameterEncoder(nn.Module):
     """Encodes trap parameters into a latent representation."""
@@ -26,12 +25,13 @@ class TrapParameterEncoder(nn.Module):
     ):
         super().__init__()
         
+        # Using PhysicsNeMo's FullyConnected module
         self.encoder = FullyConnected(
             in_features=trap_dim + 3,  # trap params + voltage + thickness + pulsewidth
             out_features=latent_dim,
             num_layers=num_layers,
             layer_size=hidden_dim,
-            activation=activation,
+            activation_fn=activation,
             skip_connections=True
         )
         
@@ -45,7 +45,7 @@ class TrapParameterEncoder(nn.Module):
         """
         Args:
             trap_params: [batch_size, 8]
-            voltage: [batch_size, 1]
+            voltage: [batch_size, 1] 
             thickness: [batch_size, 1]
             pulsewidth: [batch_size, 1]
             
@@ -64,7 +64,7 @@ class TrapParameterEncoder(nn.Module):
 
 
 class PhysicsInformedEvolution(nn.Module):
-    """Physics-informed temporal evolution module."""
+    """Physics-informed temporal evolution module using LSTM."""
     
     def __init__(
         self,
@@ -89,16 +89,16 @@ class PhysicsInformedEvolution(nn.Module):
             batch_first=True
         )
         
-        # Output projection
+        # Output projection using PhysicsNeMo's FullyConnected
         self.output_projection = FullyConnected(
             in_features=hidden_dim,
             out_features=state_dim,
             num_layers=2,
             layer_size=hidden_dim // 2,
-            activation='relu'
+            activation_fn='relu'
         )
         
-        # Physics-based generation rate (inspired by kMC)
+        # Physics-based generation rate
         self.generation_rate = nn.Sequential(
             nn.Linear(latent_dim + 1, hidden_dim),  # device params + current state
             nn.ReLU(),
@@ -164,7 +164,7 @@ class PhysicsInformedEvolution(nn.Module):
             # Predict state change
             delta_state = self.output_projection(lstm_out)  # [batch_size, 1]
             
-            # Apply physics constraint: defects can only increase (monotonic)
+            # Apply physics constraint: defects can only increase
             delta_state = F.relu(delta_state)
             
             # Scale by generation rate
@@ -183,7 +183,7 @@ class PhysicsInformedEvolution(nn.Module):
 
 
 class BreakdownPredictor(nn.Module):
-    """Predicts breakdown probability based on current state and device parameters."""
+    """Predicts breakdown probability based on current state."""
     
     def __init__(
         self,
@@ -200,7 +200,7 @@ class BreakdownPredictor(nn.Module):
             out_features=1,
             num_layers=3,
             layer_size=hidden_dim,
-            activation='relu'
+            activation_fn='relu'
         )
         
     def forward(
@@ -241,7 +241,7 @@ class BreakdownPredictor(nn.Module):
         # Predict breakdown probability
         breakdown_logits = self.predictor(inputs).squeeze(-1)  # [batch_size, seq_len]
         
-        # Add hard threshold - if state >= 200, breakdown prob = 1
+        # Add hard threshold
         hard_breakdown = (states.squeeze(-1) >= self.threshold).float()
         
         # Combine learned and hard threshold
@@ -287,28 +287,19 @@ class FerroelectricSurrogate(nn.Module):
             out_features=latent_dim // 2,
             num_layers=2,
             layer_size=hidden_dim // 2,
-            activation='gelu'
+            activation_fn='gelu'
         )
         
         # Combine encodings
         self.combine_latents = nn.Linear(latent_dim + latent_dim // 2, latent_dim)
         
         # Temporal evolution model
-        if use_fno:
-            self.evolution_model = FNO1d(
-                in_channels=state_dim + latent_dim,
-                out_channels=state_dim,
-                modes=16,
-                width=hidden_dim,
-                n_layers=4
-            )
-        else:
-            self.evolution_model = PhysicsInformedEvolution(
-                state_dim=state_dim,
-                latent_dim=latent_dim,
-                hidden_dim=hidden_dim,
-                num_layers=evolution_layers
-            )
+        self.evolution_model = PhysicsInformedEvolution(
+            state_dim=state_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            num_layers=evolution_layers
+        )
             
         # Breakdown predictor
         self.breakdown_predictor = BreakdownPredictor(
@@ -375,14 +366,9 @@ class FerroelectricSurrogate(nn.Module):
         )
         
         # Generate predictions
-        if self.use_fno:
-            # FNO expects [batch, channels, length]
-            # We'll use a different approach for FNO
-            raise NotImplementedError("FNO evolution not yet implemented")
-        else:
-            predictions = self.evolution_model(
-                initial_states, device_latent, target_length
-            )
+        predictions = self.evolution_model(
+            initial_states, device_latent, target_length
+        )
             
         # Calculate cycles for each prediction
         initial_cycles = initial_states.size(1)
@@ -468,22 +454,19 @@ class FerroelectricSurrogate(nn.Module):
             predictions = outputs['predictions']
             breakdown_prob = outputs['breakdown_prob']
             
-            # Check for breakdown in predictions
-            # If current prediction >= threshold, device has broken down
-            # Mark all subsequent predictions as broken (could use a special value or mask)
+            # Check for breakdown
             for i in range(batch_size):
                 if not has_broken[i]:
-                    # Check if any prediction in this chunk exceeds threshold
+                    # Check defect threshold
                     exceeds_threshold = predictions[i] >= self.breakdown_threshold
                     if exceeds_threshold.any():
                         first_exceed = exceeds_threshold.nonzero()[0].item()
                         breakdown_cycles[i] = current_cycle + first_exceed
                         has_broken[i] = True
-                        # Important: Don't continue predicting after breakdown
-                        # Set remaining predictions to the breakdown value
+                        # Set all subsequent predictions to breakdown threshold
                         predictions[i, first_exceed + 1:] = self.breakdown_threshold
                     
-                    # Also check breakdown probability
+                    # Check breakdown probability
                     high_prob = breakdown_prob[i] >= breakdown_threshold
                     if high_prob.any() and not has_broken[i]:
                         first_high_prob = high_prob.nonzero()[0].item()

@@ -44,7 +44,7 @@ def main():
                        default='all', help='Pipeline mode')
     parser.add_argument('--config', type=str, default='config/training_config.yaml',
                        help='Path to config file')
-    parser.add_argument('--data_path', type=str, default='data/raw/kmc_run1_6nm_80dev_1.csv',
+    parser.add_argument('--data_path', type=str, default='data/kmc_run1_6nm_80dev_1.csv',
                        help='Path to input CSV data')
     parser.add_argument('--checkpoint', type=str, help='Path to checkpoint for generation')
     parser.add_argument('--num_synthetic', type=int, default=1000,
@@ -66,7 +66,7 @@ def main():
     
     # Step 1: Data preparation
     if args.mode in ['all', 'prepare']:
-        cmd = f"python scripts/prepare_data.py --input {args.data_path} --output data/processed/"
+        cmd = f"python prepare_data.py --input {args.data_path} --output data/processed/"
         success = run_command(cmd, "Data preparation")
         if not success and args.mode == 'all':
             logger.error("Stopping pipeline due to data preparation failure")
@@ -89,10 +89,10 @@ def main():
             logger.error("Stopping pipeline due to generation failure")
             return 1
             
-    # Step 4: Evaluate results
-    if args.mode in ['all', 'evaluate']:
-        cmd = "python scripts/evaluate_results.py --synthetic_dir synthetic_data --original_data {args.data_path}"
-        success = run_command(cmd, "Results evaluation")
+    # # Step 4: Evaluate results
+    # if args.mode in ['all', 'evaluate']:
+    #     cmd = "python evaluate_results.py --synthetic_dir synthetic_data --original_data {args.data_path}"
+    #     success = run_command(cmd, "Results evaluation")
         
     logger.info("Pipeline completed successfully!" if success else "Pipeline completed with errors")
     return 0 if success else 1

@@ -53,20 +53,24 @@ def main():
     args = parser.parse_args()
     logger = setup_logging()
     
+    # Change to project directory
+    project_dir = Path('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
+    
     # Load config
-    with open(args.config, 'r') as f:
+    config_path = project_dir / args.config
+    with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
         
     # Create necessary directories
     dirs = ['data/processed', 'checkpoints', 'logs', 'synthetic_data', 'results']
     for dir_path in dirs:
-        Path(dir_path).mkdir(parents=True, exist_ok=True)
+        (project_dir / dir_path).mkdir(parents=True, exist_ok=True)
         
     success = True
     
     # Step 1: Data preparation
     if args.mode in ['all', 'prepare']:
-        cmd = f"python prepare_data.py --input {args.data_path} --output data/processed/"
+        cmd = f"cd {project_dir} && python prepare_data.py --input {args.data_path} --output data/processed/"
         success = run_command(cmd, "Data preparation")
         if not success and args.mode == 'all':
             logger.error("Stopping pipeline due to data preparation failure")
@@ -74,7 +78,7 @@ def main():
             
     # Step 2: Training
     if args.mode in ['all', 'train']:
-        cmd = "python training/train.py"
+        cmd = f"cd {project_dir} && python training/train.py"
         success = run_command(cmd, "Model training")
         if not success and args.mode == 'all':
             logger.error("Stopping pipeline due to training failure")
@@ -83,21 +87,15 @@ def main():
     # Step 3: Generate synthetic data
     if args.mode in ['all', 'generate']:
         checkpoint = args.checkpoint or "checkpoints/best_model.pt"
-        cmd = f"python inference/generate.py --checkpoint {checkpoint} --num_samples {args.num_synthetic} --output_dir synthetic_data --visualize"
+        cmd = f"cd {project_dir} && python inference/generate.py --checkpoint {checkpoint} --num_samples {args.num_synthetic} --output_dir synthetic_data --visualize"
         success = run_command(cmd, "Synthetic data generation")
         if not success and args.mode == 'all':
             logger.error("Stopping pipeline due to generation failure")
             return 1
             
-    # # Step 4: Evaluate results
-    # if args.mode in ['all', 'evaluate']:
-    #     cmd = "python evaluate_results.py --synthetic_dir synthetic_data --original_data {args.data_path}"
-    #     success = run_command(cmd, "Results evaluation")
-        
     logger.info("Pipeline completed successfully!" if success else "Pipeline completed with errors")
     return 0 if success else 1
 
 
 if __name__ == '__main__':
     sys.exit(main())
-

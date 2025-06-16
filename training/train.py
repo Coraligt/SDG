@@ -1,5 +1,6 @@
 # training/train.py
 
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,12 +13,18 @@ import numpy as np
 from typing import Dict, Optional
 import wandb
 
+
 # PhysicsNeMo imports
 from physicsnemo.distributed import DistributedManager
-from physicsnemo.utils.config import get_config
-from physicsnemo.utils.checkpoint import save_checkpoint, load_checkpoint
+# from physicsnemo.utils.config import get_config  
+# from physicsnemo.utils.checkpoint import save_checkpoint, load_checkpoint  
+from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
+from physicsnemo.utils.capture import StaticCaptureTraining
+from physicsnemo.distributed import DistributedManager
 
-# Local imports
+import sys
+sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
+
 from ferroelectric_dataset import create_dataloaders
 from models.fe_surrogate import FerroelectricSurrogate
 from models.losses import PhysicsInformedLoss, GenerationRateLoss, CycleLoss
@@ -78,7 +85,8 @@ class Trainer:
         # Setup tensorboard
         if self.dist_manager.rank == 0:
             self.writer = SummaryWriter(config['training']['log_dir'])
-            
+
+
     def setup_logging(self):
         """Setup logging configuration."""
         logging.basicConfig(

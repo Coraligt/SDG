@@ -44,7 +44,7 @@ def main():
                        default='all', help='Pipeline mode')
     parser.add_argument('--config', type=str, default='config/training_config.yaml',
                        help='Path to config file')
-    parser.add_argument('--data_path', type=str, default='data/kmc_run1_6nm_80dev 1.csv',
+    parser.add_argument('--data_path', type=str, default='data/kmc_run1_6nm_80dev_1.csv',
                        help='Path to input CSV data')
     parser.add_argument('--checkpoint', type=str, help='Path to checkpoint for generation')
     parser.add_argument('--num_synthetic', type=int, default=1000,

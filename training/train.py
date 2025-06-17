@@ -1,6 +1,5 @@
 # training/train.py
 
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,14 +12,9 @@ import numpy as np
 from typing import Dict, Optional
 import wandb
 
-
-# PhysicsNeMo imports
+# PhysicsNeMo imports - only use what exists
 from physicsnemo.distributed import DistributedManager
-# from physicsnemo.utils.config import get_config  
-# from physicsnemo.utils.checkpoint import save_checkpoint, load_checkpoint  
-from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
-from physicsnemo.utils.capture import StaticCaptureTraining
-from physicsnemo.distributed import DistributedManager
+from physicsnemo.launch.logging import LaunchLogger
 
 import sys
 sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
@@ -74,19 +68,16 @@ class Trainer:
         self.current_epoch = 0
         self.best_val_loss = float('inf')
         
-        # Initialize wandb if enabled
-        if config['training']['use_wandb'] and self.dist_manager.rank == 0:
-            wandb.init(
-                project=config['wandb']['project'],
-                name=config['wandb']['run_name'],
-                config=config
-            )
-            
+        # Initialize LaunchLogger
+        LaunchLogger.initialize(
+            use_wandb=config['training'].get('use_wandb', False),
+            use_mlflow=False
+        )
+        
         # Setup tensorboard
         if self.dist_manager.rank == 0:
             self.writer = SummaryWriter(config['training']['log_dir'])
-
-
+            
     def setup_logging(self):
         """Setup logging configuration."""
         logging.basicConfig(
@@ -163,207 +154,240 @@ class Trainer:
     def train_epoch(self):
         """Train for one epoch."""
         self.model.train()
-        epoch_losses = {
-            'total': 0.0,
-            'prediction': 0.0,
-            'breakdown': 0.0,
-            'monotonic': 0.0,
-            'smoothness': 0.0,
-            'physics': 0.0,
-            'generation': 0.0,
-            'cycle': 0.0
-        }
         
-        progress_bar = tqdm(
-            self.train_loader,
-            desc=f"Epoch {self.current_epoch}",
-            disable=self.dist_manager.rank != 0
-        )
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+        with LaunchLogger(
+            "train", 
+            epoch=self.current_epoch, 
+            num_mini_batch=len(self.train_loader),
+            epoch_alert_freq=1
+        ) as logger:
             
-            # Forward pass
-            outputs = self.model(
-                trap_params=batch['trap_parameters'],
-                voltage=batch['voltage'],
-                thickness=batch['thickness'],
-                pulsewidth=batch['pulsewidth'],
-                initial_states=batch['initial_states'],
-                target_length=batch['target_states'].size(1)
+            epoch_losses = {
+                'total': 0.0,
+                'prediction': 0.0,
+                'breakdown': 0.0,
+                'monotonic': 0.0,
+                'smoothness': 0.0,
+                'physics': 0.0,
+                'generation': 0.0,
+                'cycle': 0.0
+            }
+            
+            progress_bar = tqdm(
+                self.train_loader,
+                desc=f"Epoch {self.current_epoch}",
+                disable=self.dist_manager.rank != 0
             )
             
-            # Calculate losses
-            losses = self.criterion(
-                predictions=outputs['predictions'],
-                targets=batch['target_states'],
-                breakdown_prob=outputs['breakdown_prob'],
-                valid_mask=batch['valid_mask'],
-                voltage=batch['voltage'],
-                thickness=batch['thickness']
-            )
-            
-            # Additional physics losses
-            gen_loss = self.generation_loss(
-                predictions=outputs['predictions'],
-                voltage=batch['voltage'],
-                thickness=batch['thickness'],
-                trap_params=batch['trap_parameters'],
-                valid_mask=batch['valid_mask']
-            )
-            
-            cycle_loss = self.cycle_loss(
-                breakdown_prob=outputs['breakdown_prob'],
-                breakdown_cycles=batch['breakdown_cycle'],
-                initial_cycles=self.config['data']['initial_cycles']
-            )
-            
-            # Combine all losses
-            total_loss = (
-                losses['total'] + 
-                self.config['loss']['generation_weight'] * gen_loss +
-                self.config['loss']['cycle_weight'] * cycle_loss
-            )
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            
-            # Gradient clipping
-            if self.config['training'].get('gradient_clip_val'):
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config['training']['gradient_clip_val']
+            for batch_idx, batch in enumerate(progress_bar):
+                # Move batch to device
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                
+                # Forward pass
+                outputs = self.model(
+                    trap_params=batch['trap_parameters'],
+                    voltage=batch['voltage'],
+                    thickness=batch['thickness'],
+                    pulsewidth=batch['pulsewidth'],
+                    initial_states=batch['initial_states'],
+                    target_length=batch['target_states'].size(1)
                 )
                 
-            self.optimizer.step()
-            
-            # Update metrics
-            epoch_losses['total'] += total_loss.item()
-            for key, value in losses.items():
-                if key != 'total':
-                    epoch_losses[key] += value.item()
-            epoch_losses['generation'] += gen_loss.item()
-            epoch_losses['cycle'] += cycle_loss.item()
-            
-            # Update progress bar
-            if batch_idx % 10 == 0:
-                progress_bar.set_postfix({
-                    'loss': f"{total_loss.item():.4f}",
-                    'pred': f"{losses['prediction'].item():.4f}"
+                # Calculate losses
+                losses = self.criterion(
+                    predictions=outputs['predictions'],
+                    targets=batch['target_states'],
+                    breakdown_prob=outputs['breakdown_prob'],
+                    valid_mask=batch['valid_mask'],
+                    voltage=batch['voltage'],
+                    thickness=batch['thickness']
+                )
+                
+                # Additional physics losses
+                gen_loss = self.generation_loss(
+                    predictions=outputs['predictions'],
+                    voltage=batch['voltage'],
+                    thickness=batch['thickness'],
+                    trap_params=batch['trap_parameters'],
+                    valid_mask=batch['valid_mask']
+                )
+                
+                cycle_loss = self.cycle_loss(
+                    breakdown_prob=outputs['breakdown_prob'],
+                    breakdown_cycles=batch['breakdown_cycle'],
+                    initial_cycles=self.config['data']['initial_cycles']
+                )
+                
+                # Combine all losses
+                total_loss = (
+                    losses['total'] + 
+                    self.config['loss']['generation_weight'] * gen_loss +
+                    self.config['loss']['cycle_weight'] * cycle_loss
+                )
+                
+                # Backward pass
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                
+                # Gradient clipping
+                if self.config['training'].get('gradient_clip_val'):
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config['training']['gradient_clip_val']
+                    )
+                    
+                self.optimizer.step()
+                
+                # Update metrics
+                epoch_losses['total'] += total_loss.item()
+                for key, value in losses.items():
+                    if key != 'total':
+                        epoch_losses[key] += value.item()
+                epoch_losses['generation'] += gen_loss.item()
+                epoch_losses['cycle'] += cycle_loss.item()
+                
+                # Log minibatch
+                logger.log_minibatch({
+                    'loss': total_loss.item(),
+                    'pred_loss': losses['prediction'].item()
                 })
                 
-        # Average losses
-        num_batches = len(self.train_loader)
-        for key in epoch_losses:
-            epoch_losses[key] /= num_batches
-            
+                # Update progress bar
+                if batch_idx % 10 == 0:
+                    progress_bar.set_postfix({
+                        'loss': f"{total_loss.item():.4f}",
+                        'pred': f"{losses['prediction'].item():.4f}"
+                    })
+                    
+            # Average losses
+            num_batches = len(self.train_loader)
+            for key in epoch_losses:
+                epoch_losses[key] /= num_batches
+                
         return epoch_losses
         
     @torch.no_grad()
     def validate(self):
         """Validate the model."""
         self.model.eval()
-        val_losses = {
-            'total': 0.0,
-            'prediction': 0.0,
-            'breakdown': 0.0,
-            'monotonic': 0.0,
-            'smoothness': 0.0,
-            'physics': 0.0,
-            'generation': 0.0,
-            'cycle': 0.0
-        }
         
-        # Additional metrics
-        breakdown_errors = []
-        final_defect_errors = []
-        
-        for batch in tqdm(self.val_loader, desc="Validation", disable=self.dist_manager.rank != 0):
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+        with LaunchLogger(
+            "val",
+            epoch=self.current_epoch,
+            num_mini_batch=len(self.val_loader),
+            epoch_alert_freq=1
+        ) as logger:
             
-            # Forward pass
-            outputs = self.model(
-                trap_params=batch['trap_parameters'],
-                voltage=batch['voltage'],
-                thickness=batch['thickness'],
-                pulsewidth=batch['pulsewidth'],
-                initial_states=batch['initial_states'],
-                target_length=batch['target_states'].size(1)
-            )
+            val_losses = {
+                'total': 0.0,
+                'prediction': 0.0,
+                'breakdown': 0.0,
+                'monotonic': 0.0,
+                'smoothness': 0.0,
+                'physics': 0.0,
+                'generation': 0.0,
+                'cycle': 0.0
+            }
             
-            # Calculate losses
-            losses = self.criterion(
-                predictions=outputs['predictions'],
-                targets=batch['target_states'],
-                breakdown_prob=outputs['breakdown_prob'],
-                valid_mask=batch['valid_mask'],
-                voltage=batch['voltage'],
-                thickness=batch['thickness']
-            )
+            # Additional metrics
+            breakdown_errors = []
+            final_defect_errors = []
             
-            gen_loss = self.generation_loss(
-                predictions=outputs['predictions'],
-                voltage=batch['voltage'],
-                thickness=batch['thickness'],
-                trap_params=batch['trap_parameters'],
-                valid_mask=batch['valid_mask']
-            )
-            
-            cycle_loss = self.cycle_loss(
-                breakdown_prob=outputs['breakdown_prob'],
-                breakdown_cycles=batch['breakdown_cycle'],
-                initial_cycles=self.config['data']['initial_cycles']
-            )
-            
-            total_loss = (
-                losses['total'] + 
-                self.config['loss']['generation_weight'] * gen_loss +
-                self.config['loss']['cycle_weight'] * cycle_loss
-            )
-            
-            # Update losses
-            val_losses['total'] += total_loss.item()
-            for key, value in losses.items():
-                if key != 'total':
-                    val_losses[key] += value.item()
-            val_losses['generation'] += gen_loss.item()
-            val_losses['cycle'] += cycle_loss.item()
-            
-            # Calculate additional metrics
-            # Predict breakdown cycle
-            predicted_breakdown = outputs['breakdown_prob'].argmax(dim=1) + self.config['data']['initial_cycles']
-            breakdown_error = torch.abs(predicted_breakdown - batch['breakdown_cycle']).float().mean()
-            breakdown_errors.append(breakdown_error.item())
-            
-            # Final defect count error
-            batch_size = batch['target_states'].size(0)
-            final_predictions = []
-            final_targets = []
-            
-            for i in range(batch_size):
-                valid_idx = batch['valid_mask'][i].nonzero()
-                if len(valid_idx) > 0:
-                    last_idx = valid_idx[-1].item()
-                    final_predictions.append(outputs['predictions'][i, last_idx])
-                    final_targets.append(batch['target_states'][i, last_idx])
-                    
-            if final_predictions:
-                final_predictions = torch.stack(final_predictions)
-                final_targets = torch.stack(final_targets)
-                final_error = torch.abs(final_predictions - final_targets).mean()
-                final_defect_errors.append(final_error.item())
+            for batch in tqdm(self.val_loader, desc="Validation", disable=self.dist_manager.rank != 0):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
                 
-        # Average losses
-        num_batches = len(self.val_loader)
-        for key in val_losses:
-            val_losses[key] /= num_batches
+                # Forward pass
+                outputs = self.model(
+                    trap_params=batch['trap_parameters'],
+                    voltage=batch['voltage'],
+                    thickness=batch['thickness'],
+                    pulsewidth=batch['pulsewidth'],
+                    initial_states=batch['initial_states'],
+                    target_length=batch['target_states'].size(1)
+                )
+                
+                # Calculate losses
+                losses = self.criterion(
+                    predictions=outputs['predictions'],
+                    targets=batch['target_states'],
+                    breakdown_prob=outputs['breakdown_prob'],
+                    valid_mask=batch['valid_mask'],
+                    voltage=batch['voltage'],
+                    thickness=batch['thickness']
+                )
+                
+                gen_loss = self.generation_loss(
+                    predictions=outputs['predictions'],
+                    voltage=batch['voltage'],
+                    thickness=batch['thickness'],
+                    trap_params=batch['trap_parameters'],
+                    valid_mask=batch['valid_mask']
+                )
+                
+                cycle_loss = self.cycle_loss(
+                    breakdown_prob=outputs['breakdown_prob'],
+                    breakdown_cycles=batch['breakdown_cycle'],
+                    initial_cycles=self.config['data']['initial_cycles']
+                )
+                
+                total_loss = (
+                    losses['total'] + 
+                    self.config['loss']['generation_weight'] * gen_loss +
+                    self.config['loss']['cycle_weight'] * cycle_loss
+                )
+                
+                # Log minibatch
+                logger.log_minibatch({
+                    'loss': total_loss.item(),
+                    'pred_loss': losses['prediction'].item()
+                })
+                
+                # Update losses
+                val_losses['total'] += total_loss.item()
+                for key, value in losses.items():
+                    if key != 'total':
+                        val_losses[key] += value.item()
+                val_losses['generation'] += gen_loss.item()
+                val_losses['cycle'] += cycle_loss.item()
+                
+                # Calculate additional metrics
+                predicted_breakdown = outputs['breakdown_prob'].argmax(dim=1) + self.config['data']['initial_cycles']
+                breakdown_error = torch.abs(predicted_breakdown - batch['breakdown_cycle']).float().mean()
+                breakdown_errors.append(breakdown_error.item())
+                
+                # Final defect count error
+                batch_size = batch['target_states'].size(0)
+                final_predictions = []
+                final_targets = []
+                
+                for i in range(batch_size):
+                    valid_idx = batch['valid_mask'][i].nonzero()
+                    if len(valid_idx) > 0:
+                        last_idx = valid_idx[-1].item()
+                        final_predictions.append(outputs['predictions'][i, last_idx])
+                        final_targets.append(batch['target_states'][i, last_idx])
+                        
+                if final_predictions:
+                    final_predictions = torch.stack(final_predictions)
+                    final_targets = torch.stack(final_targets)
+                    final_error = torch.abs(final_predictions - final_targets).mean()
+                    final_defect_errors.append(final_error.item())
+                    
+            # Average losses
+            num_batches = len(self.val_loader)
+            for key in val_losses:
+                val_losses[key] /= num_batches
+                
+            # Additional metrics
+            val_losses['breakdown_mae'] = np.mean(breakdown_errors)
+            val_losses['final_defect_mae'] = np.mean(final_defect_errors)
             
-        # Additional metrics
-        val_losses['breakdown_mae'] = np.mean(breakdown_errors)
-        val_losses['final_defect_mae'] = np.mean(final_defect_errors)
-        
+            # Log epoch-level metrics
+            logger.log_epoch({
+                'breakdown_mae': val_losses['breakdown_mae'],
+                'final_defect_mae': val_losses['final_defect_mae']
+            })
+            
         return val_losses
         
     def save_checkpoint(self, filename: str):
@@ -428,7 +452,7 @@ class Trainer:
         self.logger.info("Training completed!")
         
     def log_metrics(self, train_losses: Dict, val_losses: Dict):
-        """Log metrics to tensorboard and wandb."""
+        """Log metrics to tensorboard and console."""
         # Console logging
         self.logger.info(
             f"Epoch {self.current_epoch}: "
@@ -448,21 +472,12 @@ class Trainer:
             # Learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
             self.writer.add_scalar('train/lr', current_lr, self.current_epoch)
-            
-        # Wandb logging
-        if self.config['training']['use_wandb'] and self.dist_manager.rank == 0:
-            wandb.log({
-                'epoch': self.current_epoch,
-                **{f'train/{k}': v for k, v in train_losses.items()},
-                **{f'val/{k}': v for k, v in val_losses.items()},
-                'lr': self.optimizer.param_groups[0]['lr']
-            })
 
 
 def main():
     """Main training function."""
-    # Load config
-    with open('config/training_config.yaml', 'r') as f:
+    # Load config with full path
+    with open('/storage/home/hcoda1/6/cli872/scratch/work/SDG/config/training_config.yaml', 'r') as f:
         config = yaml.safe_load(f)
         
     # Create trainer
@@ -476,9 +491,6 @@ def main():
     trainer.train()
     
     # Cleanup
-    if trainer.config['training']['use_wandb'] and trainer.dist_manager.rank == 0:
-        wandb.finish()
-        
     if hasattr(trainer, 'writer'):
         trainer.writer.close()
 

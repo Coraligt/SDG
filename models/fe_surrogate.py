@@ -5,12 +5,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, List
 import numpy as np
+import math
 
-# PhysicsNeMo imports 
+# PhysicsNeMo imports - only use what actually exists
 from physicsnemo.models.mlp import FullyConnected
-from physicsnemo.models.embeddings import SinusoidalEmbedding
-# from physicsnemo.models.rnn import RNN
-from physicsnemo.models.fno import FNO1d
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    """Custom sinusoidal positional embedding since PhysicsNeMo doesn't have this."""
+    
+    def __init__(self, dim: int, max_period: int = 10000):
+        super().__init__()
+        self.dim = dim
+        self.max_period = max_period
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch_size,) containing position indices
+        Returns:
+            Embeddings of shape (batch_size, dim)
+        """
+        device = x.device
+        half_dim = self.dim // 2
+        embeddings = torch.zeros(x.shape[0], self.dim, device=device)
+        
+        # Create frequency bands
+        freqs = torch.exp(
+            -math.log(self.max_period) * torch.arange(half_dim, device=device) / half_dim
+        )
+        
+        # Compute embeddings
+        args = x.unsqueeze(-1) * freqs.unsqueeze(0)
+        embeddings[:, :half_dim] = torch.sin(args)
+        embeddings[:, half_dim:] = torch.cos(args)
+        
+        return embeddings
+
 
 class TrapParameterEncoder(nn.Module):
     """Encodes trap parameters into a latent representation."""
@@ -76,7 +107,7 @@ class PhysicsInformedEvolution(nn.Module):
         super().__init__()
         
         # Time embedding for cycle information
-        self.time_embedding = SinusoidalEmbedding(
+        self.time_embedding = SinusoidalPositionalEmbedding(
             dim=32,
             max_period=2000  # max cycles
         )
@@ -463,7 +494,6 @@ class FerroelectricSurrogate(nn.Module):
                         first_exceed = exceeds_threshold.nonzero()[0].item()
                         breakdown_cycles[i] = current_cycle + first_exceed
                         has_broken[i] = True
-                        # Set all subsequent predictions to breakdown threshold
                         predictions[i, first_exceed + 1:] = self.breakdown_threshold
                     
                     # Check breakdown probability

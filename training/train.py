@@ -299,7 +299,8 @@ class Trainer:
                 epoch_losses['total'] += total_loss.item()
                 for key, value in losses.items():
                     if key != 'total':
-                        epoch_losses[key] += value.item()
+                        # epoch_losses[key] += value.item()
+                        epoch_losses[key] = epoch_losses.get(key, 0.0) + value.item()
                 epoch_losses['generation'] += gen_loss.item()
                 epoch_losses['cycle'] += cycle_loss.item()
                 

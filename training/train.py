@@ -78,8 +78,11 @@ class Trainer:
         self.criterion = PhysicsInformedLoss(
             **config['loss']['physics_informed']
         )
+        
+        # Get temperature from physics config, with fallback to default
+        temperature = config.get('physics', {}).get('temperature', 300.0)
         self.generation_loss = GenerationRateLoss(
-            temperature=config['physics']['temperature']
+            temperature=temperature
         )
         self.cycle_loss = CycleLoss()
         
@@ -131,6 +134,7 @@ class Trainer:
         """Create the surrogate model."""
         model_config = self.config['model']
         physics_config = self.config.get('physics', {
+            'temperature': 300.0,
             'constants': {
                 'k_B': 8.617e-5,
                 'q': 1.602e-19

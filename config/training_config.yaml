@@ -2,12 +2,13 @@
 
 # Data configuration
 data:
-  csv_path: "/storage/home/hcoda1/6/cli872/scratch/work/SDG/data/kmc_run1_6nm_80dev_1.csv"
+  csv_path: "data/kmc_run1_6nm_80dev_1.csv"
   initial_cycles: 5
   prediction_horizon: 50
   num_workers: 4
-  max_cycles: 2000
-  breakdown_threshold: 200
+  train_split: 0.8
+  normalize: true
+  seed: 42
 
 # Model configuration
 model:
@@ -22,20 +23,35 @@ model:
 
 # Physics configuration
 physics:
+  temperature: 300.0  # Temperature in Kelvin
   constants:
-    k_B: 8.617e-5  # eV/K
-    q: 1.602e-19   # C
+    k_B: 8.617e-5  # Boltzmann constant in eV/K
+    q: 1.602e-19   # Elementary charge in C
   device:
-    temperature_default: 300.0  # K
-  trap_parameters:
-    chi_e: 2.4  # eV
-    ET_mean: 2.75  # eV
-    ET_spread: 0.55  # eV
-    phi_TE: 4.6  # eV
-    phi_BE: 4.6  # eV
-    E_REL: 0.36  # eV
-    NT: 4.0e19  # cm^-3
-    EG: 5.8  # eV
+    temperature_default: 300.0  # Default device temperature in K
+
+# Training configuration
+training:
+  batch_size: 32
+  num_epochs: 100
+  save_every: 10
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  gradient_clip_val: 1.0
+  use_wandb: false
+  resume_from: null
+
+# Optimizer configuration
+optimizer:
+  type: "adamw"
+  lr: 1e-3
+  weight_decay: 1e-4
+
+# Scheduler configuration
+scheduler:
+  type: "cosine"
+  T_max: 100
+  eta_min: 1e-6
 
 # Loss configuration
 loss:
@@ -45,34 +61,5 @@ loss:
     monotonic_weight: 0.2
     smoothness_weight: 0.1
     physics_weight: 0.3
-    breakdown_threshold: 200.0
-  generation_weight: 0.2
-  cycle_weight: 0.3
-
-# Training configuration
-training:
-  batch_size: 16  # Reduced from 32 to avoid memory issues
-  num_epochs: 100
-  gradient_clip_val: 1.0
-  log_dir: "/storage/home/hcoda1/6/cli872/scratch/work/SDG/logs"
-  checkpoint_dir: "/storage/home/hcoda1/6/cli872/scratch/work/SDG/checkpoints"
-  save_every: 10
-  use_wandb: false
-  use_distributed: false
-
-# Optimizer configuration
-optimizer:
-  type: "adamw"
-  lr: 1.0e-4
-  weight_decay: 0.01
-
-# Scheduler configuration
-scheduler:
-  type: "cosine"
-  T_max: 100
-  eta_min: 1.0e-6
-
-# Hardware configuration
-hardware:
-  device: "cuda"
-  mixed_precision: false
+  generation_weight: 0.1
+  cycle_weight: 0.2

@@ -142,19 +142,27 @@ class FerroelectricDataset(Dataset):
             if len(valid_cycles) > 0:
                 cycle_values.extend(valid_cycles)
             
-        trap_params = np.array(trap_params)
-        voltages = np.array(voltages)
-        cycle_values = np.array(cycle_values) if cycle_values else np.array([0.0])
+        trap_params = np.array(trap_params, dtype=np.float64)  # Use float64 to prevent overflow
+        voltages = np.array(voltages, dtype=np.float64)
+        cycle_values = np.array(cycle_values, dtype=np.float64) if cycle_values else np.array([0.0])
         
-        # Calculate statistics
+        # Calculate statistics with clipping for large values
+        # Clip extremely large trap densities to reasonable range
+        trap_params[:, 0] = np.clip(trap_params[:, 0], 1e18, 1e20)  # Peak density
+        
         self.trap_mean = np.mean(trap_params, axis=0)
         self.trap_std = np.std(trap_params, axis=0) + 1e-8
         
+        # Prevent divide by zero or extremely small std
+        self.trap_std = np.maximum(self.trap_std, 1e-6)
+        
         self.voltage_mean = np.mean(voltages)
         self.voltage_std = np.std(voltages) + 1e-8
+        self.voltage_std = max(self.voltage_std, 0.1)  # Minimum std for voltage
         
         self.cycle_mean = np.mean(cycle_values)
         self.cycle_std = np.std(cycle_values) + 1e-8
+        self.cycle_std = max(self.cycle_std, 1.0)  # Minimum std for cycles
         
         # Handle thickness and pulsewidth
         thicknesses = []
@@ -164,11 +172,24 @@ class FerroelectricDataset(Dataset):
             thicknesses.append(self.data.iloc[idx]['thickness'])
             pulsewidths.append(self.data.iloc[idx]['pulsewidth'])
         
+        thicknesses = np.array(thicknesses, dtype=np.float64)
+        pulsewidths = np.array(pulsewidths, dtype=np.float64)
+        
         self.thickness_mean = np.mean(thicknesses)
         self.thickness_std = np.std(thicknesses) + 1e-8
+        self.thickness_std = max(self.thickness_std, 1e-10)  # Minimum std for thickness
         
         self.pulsewidth_mean = np.mean(pulsewidths) 
         self.pulsewidth_std = np.std(pulsewidths) + 1e-8
+        self.pulsewidth_std = max(self.pulsewidth_std, 1e-9)  # Minimum std for pulsewidth
+        
+        # Log the normalization stats for debugging
+        logger.info(f"Normalization stats calculated:")
+        logger.info(f"  Trap mean: {self.trap_mean}")
+        logger.info(f"  Trap std: {self.trap_std}")
+        logger.info(f"  Voltage mean: {self.voltage_mean:.2f}, std: {self.voltage_std:.2f}")
+        logger.info(f"  Cycle mean: {self.cycle_mean:.2f}, std: {self.cycle_std:.2f}")
+        
         
     def _get_raw_sample_by_index(self, data_idx: int) -> Dict:
         """Get raw sample data by direct index."""

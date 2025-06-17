@@ -420,7 +420,7 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
             hidden_dim=hidden_dim // 2,
             breakdown_threshold=breakdown_threshold
         )
-        
+    
     def encode_device(
         self,
         trap_params: torch.Tensor,

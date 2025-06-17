@@ -217,6 +217,7 @@ class Trainer:
             epoch_alert_freq=1
         ) as logger:
             
+            # Initialize all possible loss keys
             epoch_losses = {
                 'total': 0.0,
                 'prediction': 0.0,
@@ -224,6 +225,7 @@ class Trainer:
                 'monotonic': 0.0,
                 'smoothness': 0.0,
                 'physics': 0.0,
+                'boundary': 0.0,  # Added missing key
                 'generation': 0.0,
                 'cycle': 0.0
             }
@@ -236,19 +238,31 @@ class Trainer:
                 disable=disable_progress
             )
             
+            num_batches = 0
+            
             for batch_idx, batch in enumerate(progress_bar):
                 # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                # Skip batch if all samples have early breakdown
+                if batch['valid_mask'].sum() == 0:
+                    self.logger.warning(f"Skipping batch {batch_idx} - no valid samples")
+                    continue
                 
                 # Forward pass
-                outputs = self.model(
-                    trap_params=batch['trap_parameters'],
-                    voltage=batch['voltage'],
-                    thickness=batch['thickness'],
-                    pulsewidth=batch['pulsewidth'],
-                    initial_states=batch['initial_states'],
-                    target_length=batch['target_states'].size(1)
-                )
+                try:
+                    outputs = self.model(
+                        trap_params=batch['trap_parameters'],
+                        voltage=batch['voltage'],
+                        thickness=batch['thickness'],
+                        pulsewidth=batch['pulsewidth'],
+                        initial_states=batch['initial_states'],
+                        target_length=batch['target_states'].size(1)
+                    )
+                except Exception as e:
+                    self.logger.error(f"Forward pass error in batch {batch_idx}: {e}")
+                    continue
                 
                 # Calculate losses
                 losses = self.criterion(
@@ -282,6 +296,11 @@ class Trainer:
                     self.config['loss']['cycle_weight'] * cycle_loss
                 )
                 
+                # Check for NaN
+                if torch.isnan(total_loss):
+                    self.logger.warning(f"NaN loss detected in batch {batch_idx}, skipping")
+                    continue
+                
                 # Backward pass
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -299,16 +318,18 @@ class Trainer:
                 epoch_losses['total'] += total_loss.item()
                 for key, value in losses.items():
                     if key != 'total':
-                        # epoch_losses[key] += value.item()
-                        epoch_losses[key] = epoch_losses.get(key, 0.0) + value.item()
+                        epoch_losses[key] += value.item()
                 epoch_losses['generation'] += gen_loss.item()
                 epoch_losses['cycle'] += cycle_loss.item()
                 
+                num_batches += 1
+                
                 # Log minibatch
-                logger.log_minibatch({
-                    'loss': total_loss.item(),
-                    'pred_loss': losses['prediction'].item()
-                })
+                if not torch.isnan(total_loss):
+                    logger.log_minibatch({
+                        'loss': total_loss.item(),
+                        'pred_loss': losses['prediction'].item()
+                    })
                 
                 # Update progress bar
                 if batch_idx % 10 == 0:
@@ -318,9 +339,11 @@ class Trainer:
                     })
                     
             # Average losses
-            num_batches = len(self.train_loader)
-            for key in epoch_losses:
-                epoch_losses[key] /= num_batches
+            if num_batches > 0:
+                for key in epoch_losses:
+                    epoch_losses[key] /= num_batches
+            else:
+                self.logger.error("No valid batches in epoch!")
                 
         return epoch_losses
         
@@ -336,6 +359,7 @@ class Trainer:
             epoch_alert_freq=1
         ) as logger:
             
+            # Initialize all possible loss keys
             val_losses = {
                 'total': 0.0,
                 'prediction': 0.0,
@@ -343,6 +367,7 @@ class Trainer:
                 'monotonic': 0.0,
                 'smoothness': 0.0,
                 'physics': 0.0,
+                'boundary': 0.0,  # Added missing key
                 'generation': 0.0,
                 'cycle': 0.0
             }
@@ -352,18 +377,29 @@ class Trainer:
             final_defect_errors = []
             
             disable_progress = self.is_distributed and self.dist_manager and self.dist_manager.rank != 0
+            num_batches = 0
+            
             for batch in tqdm(self.val_loader, desc="Validation", disable=disable_progress):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                # Skip batch if all samples have early breakdown
+                if batch['valid_mask'].sum() == 0:
+                    continue
                 
                 # Forward pass
-                outputs = self.model(
-                    trap_params=batch['trap_parameters'],
-                    voltage=batch['voltage'],
-                    thickness=batch['thickness'],
-                    pulsewidth=batch['pulsewidth'],
-                    initial_states=batch['initial_states'],
-                    target_length=batch['target_states'].size(1)
-                )
+                try:
+                    outputs = self.model(
+                        trap_params=batch['trap_parameters'],
+                        voltage=batch['voltage'],
+                        thickness=batch['thickness'],
+                        pulsewidth=batch['pulsewidth'],
+                        initial_states=batch['initial_states'],
+                        target_length=batch['target_states'].size(1)
+                    )
+                except Exception as e:
+                    self.logger.error(f"Validation forward pass error: {e}")
+                    continue
                 
                 # Calculate losses
                 losses = self.criterion(
@@ -395,6 +431,10 @@ class Trainer:
                     self.config['loss']['cycle_weight'] * cycle_loss
                 )
                 
+                # Skip if NaN
+                if torch.isnan(total_loss):
+                    continue
+                
                 # Log minibatch
                 logger.log_minibatch({
                     'loss': total_loss.item(),
@@ -408,6 +448,8 @@ class Trainer:
                         val_losses[key] += value.item()
                 val_losses['generation'] += gen_loss.item()
                 val_losses['cycle'] += cycle_loss.item()
+                
+                num_batches += 1
                 
                 # Calculate additional metrics
                 predicted_breakdown = outputs['breakdown_prob'].argmax(dim=1) + self.config['data']['initial_cycles']
@@ -433,9 +475,11 @@ class Trainer:
                     final_defect_errors.append(final_error.item())
                     
             # Average losses
-            num_batches = len(self.val_loader)
-            for key in val_losses:
-                val_losses[key] /= num_batches
+            if num_batches > 0:
+                for key in val_losses:
+                    val_losses[key] /= num_batches
+            else:
+                self.logger.error("No valid batches in validation!")
                 
             # Additional metrics
             val_losses['breakdown_mae'] = np.mean(breakdown_errors) if breakdown_errors else 0.0

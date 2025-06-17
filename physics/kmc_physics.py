@@ -28,7 +28,7 @@ class KineticMonteCarloPhysics:
         self.k_B = constants.get('k_B', 8.617e-5)  # eV/K
         self.q = constants.get('q', 1.602e-19)  # C
         self.temperature = device_config.get('temperature_default', 300.0)  # K
-        
+    
     def generation_rate(
         self,
         electric_field: torch.Tensor,
@@ -50,16 +50,26 @@ class KineticMonteCarloPhysics:
         """
         nu = 1e13  # Attempt frequency (Hz)
         
+        # Ensure positive electric field
+        electric_field = torch.abs(electric_field)
+        
         # Field-lowered barrier
         barrier = activation_energy - dipole_moment * electric_field / self.q
         
-        # Ensure positive barrier
-        barrier = torch.clamp(barrier, min=0.1)
+        # Ensure positive barrier with reasonable bounds
+        barrier = torch.clamp(barrier, min=0.1, max=10.0)
         
-        # Calculate rate
-        rate = nu * torch.exp(-barrier / (self.k_B * self.temperature))
+        # Calculate rate with numerical stability
+        exponent = -barrier / (self.k_B * self.temperature)
+        exponent = torch.clamp(exponent, min=-50.0, max=50.0)  # Prevent overflow
+        
+        rate = nu * torch.exp(exponent)
+        
+        # Clamp rate to reasonable physical bounds
+        rate = torch.clamp(rate, min=1e-10, max=1e20)
         
         return rate
+
         
     def trap_assisted_tunneling_rate(
         self,

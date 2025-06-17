@@ -40,7 +40,7 @@ training:
 # Optimizer configuration
 optimizer:
   type: "adamw"
-  lr: 0.001  # Fixed: Changed from string to float
+  lr: 0.0001  # Reduced from 0.001 for stability lr: 0.001
   weight_decay: 0.01
   
 # Scheduler configuration

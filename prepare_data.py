@@ -1,7 +1,7 @@
 # prepare_data.py
 
 """
-Prepare and validate the ferroelectric dataset.
+Prepare and validate the ferroelectric dataset with CSV output.
 """
 
 import pandas as pd
@@ -9,7 +9,6 @@ import numpy as np
 import argparse
 from pathlib import Path
 import logging
-import h5py
 import json
 
 
@@ -53,14 +52,49 @@ def main():
     output_path = Path(args.output)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Save as HDF5 for faster loading
-    with h5py.File(output_path / 'processed_data.h5', 'w') as f:
-        f.create_dataset('trap_parameters', data=df.iloc[:, :4].values)
-        f.create_dataset('voltages', data=df.iloc[:, 4:6].values)
-        f.create_dataset('device_params', data=df.iloc[:, 6:8].values)
-        f.create_dataset('cycles', data=df.iloc[:, 8:].values)
-        f.create_dataset('breakdown_cycles', data=breakdown_cycles)
-        
+    # Save trap parameters as CSV
+    trap_params_df = pd.DataFrame(
+        df.iloc[:, :4].values,
+        columns=['peak_density', 'thermal_ionization_mean', 'thermal_ionization_spread', 'relaxation_energy']
+    )
+    trap_params_df.to_csv(output_path / 'trap_parameters.csv', index=False)
+    logger.info(f"Saved trap parameters to {output_path / 'trap_parameters.csv'}")
+    
+    # Save voltages as CSV
+    voltages_df = pd.DataFrame(
+        df.iloc[:, 4:6].values,
+        columns=['voltage1', 'voltage2']
+    )
+    voltages_df.to_csv(output_path / 'voltages.csv', index=False)
+    logger.info(f"Saved voltages to {output_path / 'voltages.csv'}")
+    
+    # Save device parameters as CSV
+    device_params_df = pd.DataFrame(
+        df.iloc[:, 6:8].values,
+        columns=['pulsewidth', 'thickness']
+    )
+    device_params_df.to_csv(output_path / 'device_parameters.csv', index=False)
+    logger.info(f"Saved device parameters to {output_path / 'device_parameters.csv'}")
+    
+    # Save cycles data as CSV
+    cycles_df = pd.DataFrame(df.iloc[:, 8:].values)
+    cycles_df.columns = [f'cycle_{i+1}' for i in range(cycles_df.shape[1])]
+    cycles_df.to_csv(output_path / 'cycles_data.csv', index=False)
+    logger.info(f"Saved cycles data to {output_path / 'cycles_data.csv'}")
+    
+    # Save breakdown cycles
+    breakdown_df = pd.DataFrame({
+        'sample_id': range(len(breakdown_cycles)),
+        'breakdown_cycle': breakdown_cycles
+    })
+    breakdown_df.to_csv(output_path / 'breakdown_cycles.csv', index=False)
+    logger.info(f"Saved breakdown cycles to {output_path / 'breakdown_cycles.csv'}")
+    
+    # Save complete processed data as single CSV (same format as input but cleaned)
+    df['breakdown_cycle'] = breakdown_cycles
+    df.to_csv(output_path / 'processed_complete.csv', index=False, header=False)
+    logger.info(f"Saved complete processed data to {output_path / 'processed_complete.csv'}")
+    
     # Save metadata
     metadata = {
         'num_samples': len(df),
@@ -68,13 +102,22 @@ def main():
         'max_cycles': 2000,
         'breakdown_threshold': 200,
         'avg_breakdown_cycle': float(np.mean(breakdown_cycles)),
-        'std_breakdown_cycle': float(np.std(breakdown_cycles))
+        'std_breakdown_cycle': float(np.std(breakdown_cycles)),
+        'data_files': {
+            'trap_parameters': 'trap_parameters.csv',
+            'voltages': 'voltages.csv',
+            'device_parameters': 'device_parameters.csv',
+            'cycles_data': 'cycles_data.csv',
+            'breakdown_cycles': 'breakdown_cycles.csv',
+            'complete_data': 'processed_complete.csv'
+        }
     }
     
     with open(output_path / 'metadata.json', 'w') as f:
         json.dump(metadata, f, indent=2)
         
     logger.info(f"Data prepared and saved to {output_path}")
+    logger.info("All data saved in CSV format for easy access")
 
 
 if __name__ == '__main__':

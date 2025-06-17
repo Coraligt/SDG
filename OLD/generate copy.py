@@ -4,12 +4,14 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import h5py
 import json
 from typing import Dict, List, Optional, Tuple
 import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+# Add the project root to path
 import sys
 sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
 
@@ -304,97 +306,70 @@ class SyntheticDataGenerator:
         self,
         data: Dict[str, np.ndarray],
         output_dir: str,
-        format: str = 'csv'
+        format: str = 'hdf5'
     ):
-        """Save generated dataset in CSV format."""
+        """Save generated dataset."""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Always save as CSV now
-        # Save complete dataset in same format as original
-        num_samples = len(data['voltages'])
-        max_cycles = data['trajectories'].shape[1]
-        
-        # Create dataframe with all data
-        all_data = []
-        
-        for i in range(num_samples):
-            row = []
-            # Add trap parameters (only first 4, others are fixed)
-            row.extend(data['trap_parameters'][i, :4])
-            # Add voltages
-            row.append(data['voltages'][i])
-            row.append(-data['voltages'][i])  # Voltage 2 (symmetric)
-            # Add pulsewidth and thickness
-            row.append(data['pulsewidth'][i])
-            row.append(data['thickness'][i])
-            # Add trajectory
-            trajectory = data['trajectories'][i]
-            # Replace values after breakdown with NaN
-            breakdown_idx = int(data['breakdown_cycles'][i])
-            if breakdown_idx < max_cycles:
-                trajectory[breakdown_idx:] = np.nan
-            row.extend(trajectory)
-            
-            all_data.append(row)
-            
-        # Save as complete CSV
-        df_complete = pd.DataFrame(all_data)
-        df_complete.to_csv(output_path / 'synthetic_data_complete.csv', index=False, header=False)
-        self.logger.info(f"Saved complete synthetic data to {output_path / 'synthetic_data_complete.csv'}")
-        
-        # Also save individual components for analysis
-        # Save trap parameters
-        trap_params_df = pd.DataFrame(
-            data['trap_parameters'][:, :4],
-            columns=['peak_density', 'thermal_ionization_mean', 'thermal_ionization_spread', 'relaxation_energy']
-        )
-        trap_params_df.to_csv(output_path / 'synthetic_trap_parameters.csv', index=False)
-        
-        # Save voltages and device parameters
-        device_df = pd.DataFrame({
-            'voltage1': data['voltages'],
-            'voltage2': -data['voltages'],
-            'pulsewidth': data['pulsewidth'],
-            'thickness': data['thickness'],
-            'breakdown_cycle': data['breakdown_cycles'],
-            'final_defect_count': data['final_defect_counts']
-        })
-        device_df.to_csv(output_path / 'synthetic_device_parameters.csv', index=False)
-        
-        # Save trajectories
-        trajectories_df = pd.DataFrame(data['trajectories'])
-        trajectories_df.columns = [f'cycle_{i+1}' for i in range(trajectories_df.shape[1])]
-        trajectories_df.to_csv(output_path / 'synthetic_trajectories.csv', index=False)
-        
-        # Save metadata
-        metadata = {
-            'num_samples': num_samples,
-            'generation_config': {
-                'model_checkpoint': str(self.config['training']['checkpoint_dir']),
-                'breakdown_threshold': self.config['model']['breakdown_threshold'],
-                'physics_model': 'kinetic_monte_carlo',
-                'generation_model': 'thermochemical'
-            },
-            'statistics': {
-                'avg_breakdown_cycle': float(np.mean(data['breakdown_cycles'])),
-                'std_breakdown_cycle': float(np.std(data['breakdown_cycles'])),
-                'avg_final_defects': float(np.mean(data['final_defect_counts'])),
-                'std_final_defects': float(np.std(data['final_defect_counts']))
-            },
-            'data_files': {
-                'complete_data': 'synthetic_data_complete.csv',
-                'trap_parameters': 'synthetic_trap_parameters.csv',
-                'device_parameters': 'synthetic_device_parameters.csv',
-                'trajectories': 'synthetic_trajectories.csv'
+        if format == 'hdf5':
+            # Save as HDF5
+            with h5py.File(output_path / 'synthetic_data.h5', 'w') as f:
+                for key, value in data.items():
+                    f.create_dataset(key, data=value, compression='gzip')
+                    
+            # Save metadata
+            metadata = {
+                'num_samples': len(data['voltages']),
+                'generation_config': {
+                    'model_checkpoint': str(self.config['training']['checkpoint_dir']),
+                    'breakdown_threshold': self.config['model']['breakdown_threshold'],
+                    'physics_model': 'kinetic_monte_carlo',
+                    'generation_model': 'thermochemical'
+                },
+                'statistics': {
+                    'avg_breakdown_cycle': float(np.mean(data['breakdown_cycles'])),
+                    'std_breakdown_cycle': float(np.std(data['breakdown_cycles'])),
+                    'avg_final_defects': float(np.mean(data['final_defect_counts'])),
+                    'std_final_defects': float(np.std(data['final_defect_counts']))
+                }
             }
-        }
-        
-        with open(output_path / 'metadata.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
+            
+            with open(output_path / 'metadata.json', 'w') as f:
+                json.dump(metadata, f, indent=2)
+                
+        elif format == 'csv':
+            # Convert to CSV format similar to original
+            num_samples = len(data['voltages'])
+            max_cycles = data['trajectories'].shape[1]
+            
+            # Create dataframe
+            df_data = []
+            
+            for i in range(num_samples):
+                row = []
+                # Add trap parameters (only first 4, others are fixed)
+                row.extend(data['trap_parameters'][i, :4])
+                # Add voltage
+                row.append(data['voltages'][i])
+                row.append(-data['voltages'][i])  # Voltage 2 (symmetric)
+                # Add pulsewidth and thickness
+                row.append(data['pulsewidth'][i])
+                row.append(data['thickness'][i])
+                # Add trajectory
+                trajectory = data['trajectories'][i]
+                # Pad with NaN after breakdown
+                breakdown_idx = int(data['breakdown_cycles'][i])
+                if breakdown_idx < max_cycles:
+                    trajectory[breakdown_idx:] = np.nan
+                row.extend(trajectory)
+                
+                df_data.append(row)
+                
+            df = pd.DataFrame(df_data)
+            df.to_csv(output_path / 'synthetic_data.csv', index=False, header=False)
             
         self.logger.info(f"Saved {len(data['voltages'])} samples to {output_path}")
-        self.logger.info("All data saved in CSV format")
         
     def visualize_samples(
         self,
@@ -486,9 +461,9 @@ def main():
                        help='Minimum voltage')
     parser.add_argument('--voltage_max', type=float, default=3.6,
                        help='Maximum voltage')
-    parser.add_argument('--format', type=str, default='csv',
-                       choices=['csv'],
-                       help='Output format (now only CSV)')
+    parser.add_argument('--format', type=str, default='hdf5',
+                       choices=['hdf5', 'csv'],
+                       help='Output format')
     parser.add_argument('--visualize', action='store_true',
                        help='Create visualizations')
     parser.add_argument('--seed', type=int, default=None,
@@ -506,8 +481,8 @@ def main():
         seed=args.seed
     )
     
-    # Save dataset (always as CSV now)
-    generator.save_dataset(data, args.output_dir, format='csv')
+    # Save dataset
+    generator.save_dataset(data, args.output_dir, format=args.format)
     
     # Visualize if requested
     if args.visualize:

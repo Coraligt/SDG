@@ -11,7 +11,11 @@ import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from models.fe_surrogate import FerroelectricSurrogate
+# Add the project root to path
+import sys
+sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
+
+from models.fe_surrogate import PhysicsInformedFerroelectricSurrogate
 from ferroelectric_dataset import FerroelectricDataset
 
 
@@ -48,10 +52,21 @@ class SyntheticDataGenerator:
             
         self.logger.info("Model loaded successfully")
         
-    def _create_model(self) -> FerroelectricSurrogate:
+    def _create_model(self) -> PhysicsInformedFerroelectricSurrogate:
         """Create model from config."""
         model_config = self.config['model']
-        return FerroelectricSurrogate(
+        physics_config = self.config.get('physics', {
+            'temperature': 300.0,
+            'constants': {
+                'k_B': 8.617e-5,
+                'q': 1.602e-19
+            },
+            'device': {
+                'temperature_default': 300.0
+            }
+        })
+        
+        return PhysicsInformedFerroelectricSurrogate(
             trap_dim=model_config['trap_dim'],
             state_dim=model_config['state_dim'],
             latent_dim=model_config['latent_dim'],
@@ -59,7 +74,7 @@ class SyntheticDataGenerator:
             encoder_layers=model_config['encoder_layers'],
             evolution_layers=model_config['evolution_layers'],
             breakdown_threshold=model_config['breakdown_threshold'],
-            use_fno=model_config.get('use_fno', False)
+            physics_config=physics_config
         )
         
     def _load_normalization_stats(self):
@@ -71,8 +86,8 @@ class SyntheticDataGenerator:
             normalize=True
         )
         
-        self.trap_mean = torch.tensor(dataset.trap_mean, device=self.device)
-        self.trap_std = torch.tensor(dataset.trap_std, device=self.device)
+        self.trap_mean = torch.tensor(dataset.trap_mean, device=self.device, dtype=torch.float32)
+        self.trap_std = torch.tensor(dataset.trap_std, device=self.device, dtype=torch.float32)
         self.voltage_mean = dataset.voltage_mean
         self.voltage_std = dataset.voltage_std
         self.cycle_mean = dataset.cycle_mean
@@ -117,16 +132,16 @@ class SyntheticDataGenerator:
         # Generate random voltages
         voltages = np.random.uniform(voltage_range[0], voltage_range[1], num_samples)
         
-        # Generate initial states
+        # Generate initial states based on physics
         initial_states = self._generate_initial_states(
-            num_samples, initial_cycles, trap_params, voltages
+            num_samples, initial_cycles, trap_params, voltages, thickness
         )
         
         # Convert to tensors
         trap_params_tensor = torch.tensor(trap_params, dtype=torch.float32, device=self.device)
         voltages_tensor = torch.tensor(voltages, dtype=torch.float32, device=self.device)
-        thickness_tensor = torch.full((num_samples,), thickness, device=self.device)
-        pulsewidth_tensor = torch.full((num_samples,), pulsewidth, device=self.device)
+        thickness_tensor = torch.full((num_samples,), thickness, device=self.device, dtype=torch.float32)
+        pulsewidth_tensor = torch.full((num_samples,), pulsewidth, device=self.device, dtype=torch.float32)
         initial_states_tensor = torch.tensor(initial_states, dtype=torch.float32, device=self.device)
         
         # Normalize if needed
@@ -169,7 +184,7 @@ class SyntheticDataGenerator:
         
     def _generate_trap_parameters(self, num_samples: int) -> np.ndarray:
         """Generate realistic trap parameters based on physical ranges."""
-        # Define parameter ranges (based on the data exploration)
+        # Define parameter ranges based on the physics config and papers
         param_ranges = {
             'peak_density': (1e19, 5e19),  # cm^-3
             'thermal_ionization_mean': (2.0, 3.0),  # eV
@@ -196,22 +211,36 @@ class SyntheticDataGenerator:
         num_samples: int,
         initial_cycles: int,
         trap_params: np.ndarray,
-        voltages: np.ndarray
+        voltages: np.ndarray,
+        thickness: float
     ) -> np.ndarray:
         """Generate realistic initial states based on physics."""
         initial_states = np.zeros((num_samples, initial_cycles))
         
         for i in range(num_samples):
-            # Simple model: initial defect growth proportional to voltage and trap density
-            base_rate = 0.1 * np.abs(voltages[i]) * (trap_params[i, 0] / 1e19)
+            # Calculate electric field
+            e_field = np.abs(voltages[i]) / thickness  # V/m
+            
+            # Initial defect growth proportional to field and trap density
+            # Using simplified thermochemical model
+            field_factor = np.exp(0.1 * e_field / 1e9)  # Normalize and scale
+            density_factor = trap_params[i, 0] / 1e19  # Normalize peak density
+            
+            base_rate = 0.5 * field_factor * density_factor
             
             for j in range(initial_cycles):
                 if j == 0:
-                    initial_states[i, j] = np.random.poisson(10)  # Start with some defects
+                    # Start with some initial defects
+                    initial_states[i, j] = np.random.poisson(10)
                 else:
-                    # Exponential growth model
-                    growth = np.random.poisson(base_rate * j)
+                    # Physics-based growth model
+                    growth = np.random.poisson(base_rate * (j + 1))
                     initial_states[i, j] = initial_states[i, j-1] + growth
+                    
+                    # Cap at breakdown threshold
+                    if initial_states[i, j] > 200:
+                        initial_states[i, j] = 200
+                        break
                     
         return initial_states
         
@@ -235,8 +264,10 @@ class SyntheticDataGenerator:
             metadata = {
                 'num_samples': len(data['voltages']),
                 'generation_config': {
-                    'model_checkpoint': str(self.config),
-                    'breakdown_threshold': self.config['model']['breakdown_threshold']
+                    'model_checkpoint': str(self.config['training']['checkpoint_dir']),
+                    'breakdown_threshold': self.config['model']['breakdown_threshold'],
+                    'physics_model': 'kinetic_monte_carlo',
+                    'generation_model': 'thermochemical'
                 }
             }
             
@@ -253,8 +284,8 @@ class SyntheticDataGenerator:
             
             for i in range(num_samples):
                 row = []
-                # Add trap parameters
-                row.extend(data['trap_parameters'][i, :4])  # Only first 4 (others are fixed)
+                # Add trap parameters (only first 4, others are fixed)
+                row.extend(data['trap_parameters'][i, :4])
                 # Add voltage
                 row.append(data['voltages'][i])
                 row.append(-data['voltages'][i])  # Voltage 2 (symmetric)
@@ -266,7 +297,7 @@ class SyntheticDataGenerator:
                 # Pad with NaN after breakdown
                 breakdown_idx = data['breakdown_cycles'][i]
                 if breakdown_idx < max_cycles:
-                    trajectory[breakdown_idx:] = np.nan
+                    trajectory[int(breakdown_idx):] = np.nan
                 row.extend(trajectory)
                 
                 df_data.append(row)
@@ -289,16 +320,18 @@ class SyntheticDataGenerator:
         ax = axes[0, 0]
         for i in range(min(num_samples, len(data['trajectories']))):
             trajectory = data['trajectories'][i]
-            breakdown_cycle = data['breakdown_cycles'][i]
+            breakdown_cycle = int(data['breakdown_cycles'][i])
             
             # Plot until breakdown
             cycles = np.arange(len(trajectory))
             valid_mask = cycles < breakdown_cycle
             
-            ax.plot(cycles[valid_mask], trajectory[valid_mask], 
-                   label=f"V={data['voltages'][i]:.1f}V", alpha=0.7)
-            ax.scatter(breakdown_cycle, trajectory[breakdown_cycle-1], 
-                      marker='x', s=100, c='red')
+            if valid_mask.any():
+                ax.plot(cycles[valid_mask], trajectory[valid_mask], 
+                       label=f"V={data['voltages'][i]:.1f}V", alpha=0.7)
+                if breakdown_cycle > 0 and breakdown_cycle < len(trajectory):
+                    ax.scatter(breakdown_cycle-1, trajectory[breakdown_cycle-1], 
+                              marker='x', s=100, c='red')
             
         ax.set_xlabel('Cycles')
         ax.set_ylabel('Defect Count')

@@ -7,10 +7,8 @@ data:
   prediction_horizon: 50
   num_workers: 4
   train_split: 0.8
-  normalize: true
-  seed: 42
-
-# Model configuration
+  
+# Model configuration  
 model:
   trap_dim: 8
   state_dim: 1
@@ -19,40 +17,38 @@ model:
   encoder_layers: 3
   evolution_layers: 2
   breakdown_threshold: 200.0
-  use_fno: false
-
+  
 # Physics configuration
 physics:
-  temperature: 300.0  # Temperature in Kelvin
+  temperature: 300.0  # K
   constants:
-    k_B: 8.617e-5  # Boltzmann constant in eV/K
-    q: 1.602e-19   # Elementary charge in C
+    k_B: 8.617e-5  # eV/K
+    q: 1.602e-19   # C
   device:
-    temperature_default: 300.0  # Default device temperature in K
-
+    temperature_default: 300.0
+    
 # Training configuration
 training:
-  batch_size: 32
   num_epochs: 100
-  save_every: 10
-  log_dir: "logs"
+  batch_size: 16
   checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  save_every: 10
   gradient_clip_val: 1.0
   use_wandb: false
-  resume_from: null
-
+  
 # Optimizer configuration
 optimizer:
   type: "adamw"
-  lr: 1e-3
-  weight_decay: 1e-4
-
+  lr: 0.001  # Fixed: Changed from string to float
+  weight_decay: 0.01
+  
 # Scheduler configuration
 scheduler:
   type: "cosine"
   T_max: 100
-  eta_min: 1e-6
-
+  eta_min: 1.0e-6  # Fixed: Use proper float notation
+  
 # Loss configuration
 loss:
   physics_informed:
@@ -61,5 +57,6 @@ loss:
     monotonic_weight: 0.2
     smoothness_weight: 0.1
     physics_weight: 0.3
-  generation_weight: 0.1
-  cycle_weight: 0.2
+    breakdown_threshold: 200.0
+  generation_weight: 0.3
+  cycle_weight: 0.5

@@ -123,7 +123,6 @@ class PhysicsInformedEvolution(nn.Module):
         )
         
         # Fusion network to combine physics and RNN predictions
-        # Fixed: Ensure correct input dimensions
         self.fusion_net = FullyConnected(
             in_features=state_dim + hidden_dim,  # physics pred (1) + RNN output (hidden_dim)
             out_features=state_dim,
@@ -183,19 +182,39 @@ class PhysicsInformedEvolution(nn.Module):
             # Ensure physics_pred has correct shape [batch_size, 1]
             if physics_pred.ndim == 1:
                 physics_pred = physics_pred.unsqueeze(-1)
-            
+            elif physics_pred.ndim == 3:
+                # If it's [batch_size, 1, 1], squeeze the last dimension
+                physics_pred = physics_pred.squeeze(-1)
+                
             # 2. RNN prediction for temporal context
-            # Prepare RNN input - ensure correct dimensions
-            rnn_input = torch.cat([
+            # Prepare RNN input - ensure proper dimensions
+            # current_state is [batch_size, 1], device_latent is [batch_size, latent_dim]
+            # We need to create [batch_size, 1, 1+latent_dim] for LSTM input
+            
+            # First ensure device_latent is 2D
+            if device_latent.ndim == 1:
+                device_latent = device_latent.unsqueeze(0)
+                
+            # Concatenate along feature dimension
+            rnn_features = torch.cat([
                 current_state,  # [batch_size, 1]
                 device_latent   # [batch_size, latent_dim]
-            ], dim=-1).unsqueeze(1)  # [batch_size, 1, 1+latent_dim]
+            ], dim=-1)  # [batch_size, 1+latent_dim]
+            
+            # Add sequence dimension for LSTM
+            rnn_input = rnn_features.unsqueeze(1)  # [batch_size, 1, 1+latent_dim]
             
             rnn_out, hidden = self.temporal_rnn(rnn_input, hidden)
             rnn_out = rnn_out.squeeze(1)  # [batch_size, hidden_dim]
             
             # 3. Fuse physics and RNN predictions
-            # Ensure dimensions match for concatenation
+            # Ensure both tensors are 2D before concatenation
+            if physics_pred.ndim == 3:
+                physics_pred = physics_pred.squeeze(1)  # Remove extra dimension
+            if physics_pred.ndim == 1:
+                physics_pred = physics_pred.unsqueeze(-1)
+                
+            # Now concatenate 2D tensors
             fusion_input = torch.cat([
                 physics_pred,    # [batch_size, 1]
                 rnn_out         # [batch_size, hidden_dim]
@@ -203,7 +222,7 @@ class PhysicsInformedEvolution(nn.Module):
             
             next_state = self.fusion_net(fusion_input)  # [batch_size, state_dim]
             
-            # Ensure next_state has correct shape
+            # Ensure next_state has correct shape [batch_size, 1]
             if next_state.ndim == 1:
                 next_state = next_state.unsqueeze(-1)
             

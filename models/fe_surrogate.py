@@ -3,14 +3,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, List  # Make sure Dict is imported!
+from typing import Dict, Optional, Tuple, List
 import numpy as np
 import math
 
-# PhysicsNeMo imports - only use what actually exists
+# PhysicsNeMo imports
 from physicsnemo.models.mlp import FullyConnected
 
-# Import our physics module
+# Import physics module
 import sys
 sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
 from physics.kmc_physics import KineticMonteCarloPhysics, PhysicsConstraints, DefectEvolutionModel
@@ -49,19 +49,27 @@ class TrapParameterEncoder(nn.Module):
         """
         Args:
             trap_params: [batch_size, 8]
-            voltage: [batch_size, 1] 
-            thickness: [batch_size, 1]
-            pulsewidth: [batch_size, 1]
+            voltage: [batch_size] or [batch_size, 1]
+            thickness: [batch_size] or [batch_size, 1]
+            pulsewidth: [batch_size] or [batch_size, 1]
             
         Returns:
             latent: [batch_size, latent_dim]
         """
+        # Ensure all inputs have consistent dimensions
+        if voltage.ndim == 1:
+            voltage = voltage.unsqueeze(-1)
+        if thickness.ndim == 1:
+            thickness = thickness.unsqueeze(-1)
+        if pulsewidth.ndim == 1:
+            pulsewidth = pulsewidth.unsqueeze(-1)
+            
         # Concatenate all device parameters
         device_params = torch.cat([
             trap_params,
-            voltage.unsqueeze(-1) if voltage.ndim == 1 else voltage,
-            thickness.unsqueeze(-1) if thickness.ndim == 1 else thickness,
-            pulsewidth.unsqueeze(-1) if pulsewidth.ndim == 1 else pulsewidth
+            voltage,
+            thickness,
+            pulsewidth
         ], dim=-1)
         
         return self.encoder(device_params)
@@ -76,12 +84,13 @@ class PhysicsInformedEvolution(nn.Module):
         latent_dim: int = 64,
         hidden_dim: int = 128,
         num_layers: int = 2,
-        physics_config: Dict = None  # Can also provide default value
+        physics_config: Optional[Dict] = None
     ):
         super().__init__()
         
         self.state_dim = state_dim
         self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
         
         # Default physics config if not provided
         if physics_config is None:
@@ -114,8 +123,9 @@ class PhysicsInformedEvolution(nn.Module):
         )
         
         # Fusion network to combine physics and RNN predictions
+        # Fixed: Ensure correct input dimensions
         self.fusion_net = FullyConnected(
-            in_features=state_dim + hidden_dim,  # physics pred + RNN output
+            in_features=state_dim + hidden_dim,  # physics pred (1) + RNN output (hidden_dim)
             out_features=state_dim,
             num_layers=2,
             layer_size=hidden_dim // 2,
@@ -170,36 +180,47 @@ class PhysicsInformedEvolution(nn.Module):
                 time_step=1.0  # One cycle
             )
             
+            # Ensure physics_pred has correct shape [batch_size, 1]
+            if physics_pred.ndim == 1:
+                physics_pred = physics_pred.unsqueeze(-1)
+            
             # 2. RNN prediction for temporal context
+            # Prepare RNN input - ensure correct dimensions
             rnn_input = torch.cat([
-                current_state,
-                device_latent
-            ], dim=-1).unsqueeze(1)  # [batch_size, 1, input_dim]
+                current_state,  # [batch_size, 1]
+                device_latent   # [batch_size, latent_dim]
+            ], dim=-1).unsqueeze(1)  # [batch_size, 1, 1+latent_dim]
             
             rnn_out, hidden = self.temporal_rnn(rnn_input, hidden)
             rnn_out = rnn_out.squeeze(1)  # [batch_size, hidden_dim]
             
             # 3. Fuse physics and RNN predictions
+            # Ensure dimensions match for concatenation
             fusion_input = torch.cat([
-                physics_pred,
-                rnn_out
-            ], dim=-1)
+                physics_pred,    # [batch_size, 1]
+                rnn_out         # [batch_size, hidden_dim]
+            ], dim=-1)  # [batch_size, 1 + hidden_dim]
             
-            next_state = self.fusion_net(fusion_input)
+            next_state = self.fusion_net(fusion_input)  # [batch_size, state_dim]
+            
+            # Ensure next_state has correct shape
+            if next_state.ndim == 1:
+                next_state = next_state.unsqueeze(-1)
             
             # 4. Apply physics constraints
-            next_state = self.constraints.enforce_monotonicity(
-                torch.cat([current_state, next_state], dim=1)
-            )[:, -1:]
+            # Combine current and next state for monotonicity check
+            combined_states = torch.cat([current_state, next_state], dim=1)
+            constrained_states = self.constraints.enforce_monotonicity(combined_states)
+            next_state = constrained_states[:, -1:]
             
             next_state = self.constraints.enforce_breakdown_limit(next_state)
             
-            predictions.append(next_state)
+            predictions.append(next_state.squeeze(-1))  # Store as [batch_size]
             physics_info_list.append(physics_info)
             current_state = next_state
             
         # Stack predictions
-        predictions = torch.cat(predictions, dim=1)  # [batch_size, target_length]
+        predictions = torch.stack(predictions, dim=1)  # [batch_size, target_length]
         
         # Aggregate physics info
         aggregated_physics_info = {
@@ -255,7 +276,7 @@ class BreakdownPredictor(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            states: [batch_size, seq_len] defect counts
+            states: [batch_size, seq_len] or [batch_size, seq_len, 1] defect counts
             device_latent: [batch_size, latent_dim]
             electric_field: [batch_size] 
             cycles: [batch_size, seq_len]
@@ -263,13 +284,16 @@ class BreakdownPredictor(nn.Module):
         Returns:
             breakdown_prob: [batch_size, seq_len]
         """
-        if states.ndim == 2:
-            states = states.unsqueeze(-1)
+        # Handle different input shapes
+        if states.ndim == 3 and states.size(-1) == 1:
+            states = states.squeeze(-1)  # [batch_size, seq_len]
+        elif states.ndim == 1:
+            states = states.unsqueeze(0)  # Add batch dimension
             
-        batch_size, seq_len = states.shape[:2]
+        batch_size, seq_len = states.shape
         
         # Convert defect count to density (assuming unit volume)
-        defect_density = states.squeeze(-1) * 1e20 / 1e-12  # Convert to cm^-3
+        defect_density = states * 1e20 / 1e-12  # Convert to cm^-3
         
         # Physics-based breakdown probability
         physics_breakdown_prob = self.physics.breakdown_probability(
@@ -277,6 +301,7 @@ class BreakdownPredictor(nn.Module):
         )
         
         # Neural network prediction
+        # Expand dimensions for broadcasting
         device_latent_expanded = device_latent.unsqueeze(1).expand(
             batch_size, seq_len, -1
         )
@@ -284,9 +309,10 @@ class BreakdownPredictor(nn.Module):
             batch_size, seq_len
         ).unsqueeze(-1)
         cycles_norm = cycles.unsqueeze(-1) / 2000.0
+        states_expanded = states.unsqueeze(-1)  # [batch_size, seq_len, 1]
         
         nn_inputs = torch.cat([
-            states,
+            states_expanded,
             device_latent_expanded,
             electric_field_expanded,
             cycles_norm
@@ -299,7 +325,7 @@ class BreakdownPredictor(nn.Module):
         combined_prob = 0.7 * physics_breakdown_prob + 0.3 * nn_breakdown_prob
         
         # Hard threshold override
-        hard_breakdown = (states.squeeze(-1) >= self.breakdown_threshold).float()
+        hard_breakdown = (states >= self.breakdown_threshold).float()
         final_prob = torch.maximum(combined_prob, hard_breakdown)
         
         return final_prob
@@ -317,7 +343,7 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
         encoder_layers: int = 3,
         evolution_layers: int = 2,
         breakdown_threshold: float = 200.0,
-        physics_config: Optional[Dict] = None  # Using Optional[Dict] is also good practice
+        physics_config: Optional[Dict] = None
     ):
         super().__init__()
         
@@ -344,9 +370,9 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
             num_layers=encoder_layers
         )
         
-        # Initial state encoder
+        # Initial state encoder - handle variable initial cycles
         self.initial_state_encoder = FullyConnected(
-            in_features=state_dim * 5,  # Assuming 5 initial cycles
+            in_features=state_dim * 5,  # Assuming max 5 initial cycles
             out_features=latent_dim // 2,
             num_layers=2,
             layer_size=hidden_dim // 2,
@@ -388,8 +414,18 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
         # Encode trap parameters
         trap_latent = self.trap_encoder(trap_params, voltage, thickness, pulsewidth)
         
-        # Encode initial states
-        initial_flat = initial_states.flatten(start_dim=1)
+        # Encode initial states - pad or truncate to fixed size
+        batch_size, initial_cycles = initial_states.shape
+        
+        if initial_cycles < 5:
+            # Pad with zeros
+            padding = torch.zeros(batch_size, 5 - initial_cycles, device=initial_states.device)
+            initial_padded = torch.cat([initial_states, padding], dim=1)
+        else:
+            # Take last 5 cycles
+            initial_padded = initial_states[:, -5:]
+            
+        initial_flat = initial_padded.flatten(start_dim=1)
         initial_latent = self.initial_state_encoder(initial_flat)
         
         # Combine latents
@@ -528,10 +564,16 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
             remaining = max_cycles - current_cycle
             chunk_size = min(window_size, remaining)
             
+            # Use last 5 states or all available states
+            if current_states.size(1) >= 5:
+                input_states = current_states[:, -5:]
+            else:
+                input_states = current_states
+            
             # Generate next chunk with physics
             outputs = self.forward(
                 trap_params, voltage, thickness, pulsewidth,
-                current_states[:, -5:],  # Use last 5 states
+                input_states,
                 target_length=chunk_size
             )
             

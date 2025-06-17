@@ -1,5 +1,14 @@
 # config/training_config.yaml
 
+# Data configuration
+data:
+  csv_path: "/storage/home/hcoda1/6/cli872/scratch/work/SDG/data/kmc_run1_6nm_80dev_1.csv"
+  initial_cycles: 5
+  prediction_horizon: 50
+  num_workers: 4
+  max_cycles: 2000
+  breakdown_threshold: 200
+
 # Model configuration
 model:
   trap_dim: 8
@@ -9,72 +18,61 @@ model:
   encoder_layers: 3
   evolution_layers: 2
   breakdown_threshold: 200.0
-  use_fno: false  # Set to true to use Fourier Neural Operator
+  use_fno: false
 
-# Data configuration
-data:
-  csv_path: "data/kmc_run1_6nm_80dev_1.csv"
-  initial_cycles: 5
-  prediction_horizon: 50
-  max_cycles: 2000
-  breakdown_threshold: 200
-  num_workers: 4
-  normalize: true
-  train_split: 0.75
-
-# Training configuration
-training:
-  batch_size: 8  # Small batch size due to limited data
-  num_epochs: 1000
-  gradient_clip_val: 1.0
-  save_every: 50
-  checkpoint_dir: "checkpoints"
-  log_dir: "logs"
-  use_wandb: true
-  resume_from: null  # Path to checkpoint to resume from
-
-# Optimizer configuration
-optimizer:
-  type: "adamw"
-  lr: 5.0e-4  # lower for stability
-  weight_decay: 0.01
-
-# Scheduler configuration
-scheduler:
-  type: "cosine"
-  T_max: 500
-  eta_min: 1.0e-6
+# Physics configuration
+physics:
+  constants:
+    k_B: 8.617e-5  # eV/K
+    q: 1.602e-19   # C
+  device:
+    temperature_default: 300.0  # K
+  trap_parameters:
+    chi_e: 2.4  # eV
+    ET_mean: 2.75  # eV
+    ET_spread: 0.55  # eV
+    phi_TE: 4.6  # eV
+    phi_BE: 4.6  # eV
+    E_REL: 0.36  # eV
+    NT: 4.0e19  # cm^-3
+    EG: 5.8  # eV
 
 # Loss configuration
 loss:
   physics_informed:
     prediction_weight: 1.0
-    breakdown_weight: 1.0 # 0.5
-    monotonic_weight: 0.5  # 0.2
+    breakdown_weight: 0.5
+    monotonic_weight: 0.2
     smoothness_weight: 0.1
     physics_weight: 0.3
     breakdown_threshold: 200.0
   generation_weight: 0.2
   cycle_weight: 0.3
 
-# Physics configuration
-physics:
-  constants:
-    k_B: 8.617e-5  # Boltzmann constant in eV/K
-    q: 1.602e-19   # Elementary charge in C
-  device:
-    temperature_default: 300.0  # Kelvin
-  temperature: 300.0  # Kelvin 
-  activation_energy_range: [1.0, 1.5]  # eV
-  dipole_moment: 1.0e-29  # C*m
+# Training configuration
+training:
+  batch_size: 16  # Reduced from 32 to avoid memory issues
+  num_epochs: 100
+  gradient_clip_val: 1.0
+  log_dir: "/storage/home/hcoda1/6/cli872/scratch/work/SDG/logs"
+  checkpoint_dir: "/storage/home/hcoda1/6/cli872/scratch/work/SDG/checkpoints"
+  save_every: 10
+  use_wandb: false
+  use_distributed: false
 
-# Wandb configuration
-wandb:
-  project: "ferroelectric-sdg"
-  run_name: "fe_surrogate_baseline"
+# Optimizer configuration
+optimizer:
+  type: "adamw"
+  lr: 1.0e-4
+  weight_decay: 0.01
 
-# Device configuration
-device: "cuda"
+# Scheduler configuration
+scheduler:
+  type: "cosine"
+  T_max: 100
+  eta_min: 1.0e-6
 
-
-
+# Hardware configuration
+hardware:
+  device: "cuda"
+  mixed_precision: false

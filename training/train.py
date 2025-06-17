@@ -10,9 +10,10 @@ import logging
 from tqdm import tqdm
 import numpy as np
 from typing import Dict, Optional
+import os
 import wandb
 
-# PhysicsNeMo imports - only use what exists
+# PhysicsNeMo imports 
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import LaunchLogger, PythonLogger, RankZeroLoggingWrapper
 
@@ -33,15 +34,28 @@ class Trainer:
         # Setup logging first
         self.setup_logging()
         
-        # Initialize distributed training BEFORE creating DistributedManager instance
-        if not DistributedManager.is_initialized():
-            DistributedManager.initialize()
-            
-        # NOW create the instance
-        self.dist_manager = DistributedManager()
+        # Check if we're in a distributed environment
+        self.is_distributed = self._check_distributed_env()
         
-        # Set device based on distributed manager
-        self.device = self.dist_manager.device
+        if self.is_distributed:
+            # Initialize distributed training
+            if not DistributedManager.is_initialized():
+                try:
+                    DistributedManager.initialize()
+                    self.dist_manager = DistributedManager()
+                    self.device = self.dist_manager.device
+                    self.logger.info(f"Initialized distributed training on rank {self.dist_manager.rank}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize distributed manager: {e}")
+                    self.logger.info("Falling back to single GPU training")
+                    self.is_distributed = False
+                    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    self.dist_manager = None
+        else:
+            # Single GPU or CPU training
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.dist_manager = None
+            self.logger.info(f"Using single GPU/CPU training on device: {self.device}")
         
         # Create model
         self.model = self._create_model()
@@ -73,19 +87,38 @@ class Trainer:
         self.current_epoch = 0
         self.best_val_loss = float('inf')
         
-        # Initialize LaunchLogger
+        # Initialize LaunchLogger (handles both distributed and single GPU)
         LaunchLogger.initialize(
             use_wandb=config['training'].get('use_wandb', False),
             use_mlflow=False
         )
         
-        # Setup tensorboard and rank zero logger
-        if self.dist_manager.rank == 0:
-            self.writer = SummaryWriter(config['training']['log_dir'])
-            
+        # Setup tensorboard
+        self.writer = SummaryWriter(config['training']['log_dir'])
+        
         # Create rank zero logger wrapper
-        self.rank_zero_logger = RankZeroLoggingWrapper(self.logger, self.dist_manager)
+        if self.dist_manager:
+            self.rank_zero_logger = RankZeroLoggingWrapper(self.logger, self.dist_manager)
+        else:
+            # For single GPU, just use regular logger
+            self.rank_zero_logger = self.logger
             
+    def _check_distributed_env(self):
+        """Check if we're in a distributed environment."""
+        # Check for SLURM environment variables
+        if os.environ.get('SLURM_JOB_ID'):
+            return os.environ.get('SLURM_NPROCS', '1') != '1'
+        
+        # Check for torchrun environment variables
+        if os.environ.get('RANK') is not None:
+            return True
+            
+        # Check for OpenMPI
+        if os.environ.get('OMPI_COMM_WORLD_SIZE'):
+            return int(os.environ.get('OMPI_COMM_WORLD_SIZE', '1')) > 1
+            
+        return False
+        
     def setup_logging(self):
         """Setup logging configuration."""
         logging.basicConfig(
@@ -97,7 +130,15 @@ class Trainer:
     def _create_model(self) -> PhysicsInformedFerroelectricSurrogate:
         """Create the surrogate model."""
         model_config = self.config['model']
-        physics_config = self.config['physics']
+        physics_config = self.config.get('physics', {
+            'constants': {
+                'k_B': 8.617e-5,
+                'q': 1.602e-19
+            },
+            'device': {
+                'temperature_default': 300.0
+            }
+        })
         
         model = PhysicsInformedFerroelectricSurrogate(
             trap_dim=model_config['trap_dim'],
@@ -110,8 +151,8 @@ class Trainer:
             physics_config=physics_config
         )
         
-        # Wrap with DDP if distributed
-        if self.dist_manager.distributed:
+        # Wrap with DDP only if truly distributed
+        if self.is_distributed and self.dist_manager and self.dist_manager.distributed:
             model = nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[self.dist_manager.local_rank]
@@ -183,10 +224,12 @@ class Trainer:
                 'cycle': 0.0
             }
             
+            # Progress bar only on rank 0 (or always for single GPU)
+            disable_progress = self.is_distributed and self.dist_manager and self.dist_manager.rank != 0
             progress_bar = tqdm(
                 self.train_loader,
                 desc=f"Epoch {self.current_epoch}",
-                disable=self.dist_manager.rank != 0
+                disable=disable_progress
             )
             
             for batch_idx, batch in enumerate(progress_bar):
@@ -303,7 +346,8 @@ class Trainer:
             breakdown_errors = []
             final_defect_errors = []
             
-            for batch in tqdm(self.val_loader, desc="Validation", disable=self.dist_manager.rank != 0):
+            disable_progress = self.is_distributed and self.dist_manager and self.dist_manager.rank != 0
+            for batch in tqdm(self.val_loader, desc="Validation", disable=disable_progress):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
                 # Forward pass
@@ -389,8 +433,8 @@ class Trainer:
                 val_losses[key] /= num_batches
                 
             # Additional metrics
-            val_losses['breakdown_mae'] = np.mean(breakdown_errors)
-            val_losses['final_defect_mae'] = np.mean(final_defect_errors)
+            val_losses['breakdown_mae'] = np.mean(breakdown_errors) if breakdown_errors else 0.0
+            val_losses['final_defect_mae'] = np.mean(final_defect_errors) if final_defect_errors else 0.0
             
             # Log epoch-level metrics
             logger.log_epoch({
@@ -434,6 +478,8 @@ class Trainer:
     def train(self):
         """Main training loop."""
         self.rank_zero_logger.info("Starting training...")
+        self.rank_zero_logger.info(f"Device: {self.device}")
+        self.rank_zero_logger.info(f"Distributed: {self.is_distributed}")
         
         for epoch in range(self.current_epoch, self.config['training']['num_epochs']):
             self.current_epoch = epoch
@@ -471,8 +517,9 @@ class Trainer:
             f"Val Breakdown MAE = {val_losses['breakdown_mae']:.2f} cycles"
         )
         
-        # Tensorboard logging
-        if self.dist_manager.rank == 0:
+        # Tensorboard logging (always write in single GPU, only rank 0 in distributed)
+        should_write = not self.is_distributed or (self.dist_manager and self.dist_manager.rank == 0)
+        if should_write:
             for key, value in train_losses.items():
                 self.writer.add_scalar(f'train/{key}', value, self.current_epoch)
                 
@@ -505,7 +552,7 @@ def main():
         trainer.writer.close()
         
     # Clean up distributed if needed
-    if trainer.dist_manager.distributed:
+    if trainer.is_distributed and trainer.dist_manager:
         DistributedManager.cleanup()
 
 

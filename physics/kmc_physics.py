@@ -5,14 +5,29 @@ import torch.nn as nn
 import numpy as np
 from typing import Dict, Tuple, Optional
 
-
 class KineticMonteCarloPhysics:
     """Physics equations and constraints from kinetic Monte Carlo simulations."""
     
-    def __init__(self, config: Dict):
-        self.k_B = config['constants']['k_B']  # eV/K
-        self.q = config['constants']['q']  # C
-        self.temperature = config['device']['temperature_default']  # K
+    def __init__(self, config: Optional[Dict] = None):
+        # Default configuration
+        if config is None:
+            config = {
+                'constants': {
+                    'k_B': 8.617e-5,  # eV/K
+                    'q': 1.602e-19    # C
+                },
+                'device': {
+                    'temperature_default': 300.0  # K
+                }
+            }
+        
+        # Extract constants with defaults
+        constants = config.get('constants', {})
+        device_config = config.get('device', {})
+        
+        self.k_B = constants.get('k_B', 8.617e-5)  # eV/K
+        self.q = constants.get('q', 1.602e-19)  # C
+        self.temperature = device_config.get('temperature_default', 300.0)  # K
         
     def generation_rate(
         self,
@@ -195,10 +210,23 @@ class DefectEvolutionModel(nn.Module):
     
     def __init__(
         self,
-        physics_config: Dict,
+        physics_config: Optional[Dict] = None,
         use_neural_correction: bool = True
     ):
         super().__init__()
+        
+        # Default configuration
+        if physics_config is None:
+            physics_config = {
+                'constants': {
+                    'k_B': 8.617e-5,  # eV/K
+                    'q': 1.602e-19    # C
+                },
+                'device': {
+                    'temperature_default': 300.0  # K
+                }
+            }
+            
         self.physics = KineticMonteCarloPhysics(physics_config)
         self.constraints = PhysicsConstraints()
         self.use_neural_correction = use_neural_correction

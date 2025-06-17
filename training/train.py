@@ -14,13 +14,13 @@ import wandb
 
 # PhysicsNeMo imports - only use what exists
 from physicsnemo.distributed import DistributedManager
-from physicsnemo.launch.logging import LaunchLogger
+from physicsnemo.launch.logging import LaunchLogger, PythonLogger, RankZeroLoggingWrapper
 
 import sys
 sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
 
 from ferroelectric_dataset import create_dataloaders
-from models.fe_surrogate import FerroelectricSurrogate
+from models.fe_surrogate_physics import PhysicsInformedFerroelectricSurrogate
 from models.losses import PhysicsInformedLoss, GenerationRateLoss, CycleLoss
 
 
@@ -29,14 +29,19 @@ class Trainer:
     
     def __init__(self, config: Dict):
         self.config = config
-        self.device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
         
-        # Setup logging
+        # Setup logging first
         self.setup_logging()
         
-        # Initialize distributed training if available
+        # Initialize distributed training BEFORE creating DistributedManager instance
+        if not DistributedManager.is_initialized():
+            DistributedManager.initialize()
+            
+        # NOW create the instance
         self.dist_manager = DistributedManager()
-        self.dist_manager.initialize()
+        
+        # Set device based on distributed manager
+        self.device = self.dist_manager.device
         
         # Create model
         self.model = self._create_model()
@@ -74,9 +79,12 @@ class Trainer:
             use_mlflow=False
         )
         
-        # Setup tensorboard
+        # Setup tensorboard and rank zero logger
         if self.dist_manager.rank == 0:
             self.writer = SummaryWriter(config['training']['log_dir'])
+            
+        # Create rank zero logger wrapper
+        self.rank_zero_logger = RankZeroLoggingWrapper(self.logger, self.dist_manager)
             
     def setup_logging(self):
         """Setup logging configuration."""
@@ -84,12 +92,14 @@ class Trainer:
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-        self.logger = logging.getLogger(__name__)
+        self.logger = PythonLogger(__name__)
         
-    def _create_model(self) -> FerroelectricSurrogate:
+    def _create_model(self) -> PhysicsInformedFerroelectricSurrogate:
         """Create the surrogate model."""
         model_config = self.config['model']
-        model = FerroelectricSurrogate(
+        physics_config = self.config['physics']
+        
+        model = PhysicsInformedFerroelectricSurrogate(
             trap_dim=model_config['trap_dim'],
             state_dim=model_config['state_dim'],
             latent_dim=model_config['latent_dim'],
@@ -97,7 +107,7 @@ class Trainer:
             encoder_layers=model_config['encoder_layers'],
             evolution_layers=model_config['evolution_layers'],
             breakdown_threshold=model_config['breakdown_threshold'],
-            use_fno=model_config.get('use_fno', False)
+            physics_config=physics_config
         )
         
         # Wrap with DDP if distributed
@@ -404,7 +414,7 @@ class Trainer:
         checkpoint_path = Path(self.config['training']['checkpoint_dir']) / filename
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, checkpoint_path)
-        self.logger.info(f"Saved checkpoint to {checkpoint_path}")
+        self.rank_zero_logger.info(f"Saved checkpoint to {checkpoint_path}")
         
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
@@ -419,11 +429,11 @@ class Trainer:
         self.current_epoch = checkpoint['epoch']
         self.best_val_loss = checkpoint['best_val_loss']
         
-        self.logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
+        self.rank_zero_logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
         
     def train(self):
         """Main training loop."""
-        self.logger.info("Starting training...")
+        self.rank_zero_logger.info("Starting training...")
         
         for epoch in range(self.current_epoch, self.config['training']['num_epochs']):
             self.current_epoch = epoch
@@ -449,12 +459,12 @@ class Trainer:
             if (epoch + 1) % self.config['training']['save_every'] == 0:
                 self.save_checkpoint(f'model_epoch_{epoch + 1}.pt')
                 
-        self.logger.info("Training completed!")
+        self.rank_zero_logger.info("Training completed!")
         
     def log_metrics(self, train_losses: Dict, val_losses: Dict):
         """Log metrics to tensorboard and console."""
         # Console logging
-        self.logger.info(
+        self.rank_zero_logger.info(
             f"Epoch {self.current_epoch}: "
             f"Train Loss = {train_losses['total']:.4f}, "
             f"Val Loss = {val_losses['total']:.4f}, "
@@ -493,6 +503,10 @@ def main():
     # Cleanup
     if hasattr(trainer, 'writer'):
         trainer.writer.close()
+        
+    # Clean up distributed if needed
+    if trainer.dist_manager.distributed:
+        DistributedManager.cleanup()
 
 
 if __name__ == '__main__':

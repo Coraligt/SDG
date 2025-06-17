@@ -10,41 +10,14 @@ import math
 # PhysicsNeMo imports - only use what actually exists
 from physicsnemo.models.mlp import FullyConnected
 
-
-class SinusoidalPositionalEmbedding(nn.Module):
-    """Custom sinusoidal positional embedding since PhysicsNeMo doesn't have this."""
-    
-    def __init__(self, dim: int, max_period: int = 10000):
-        super().__init__()
-        self.dim = dim
-        self.max_period = max_period
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape (batch_size,) containing position indices
-        Returns:
-            Embeddings of shape (batch_size, dim)
-        """
-        device = x.device
-        half_dim = self.dim // 2
-        embeddings = torch.zeros(x.shape[0], self.dim, device=device)
-        
-        # Create frequency bands
-        freqs = torch.exp(
-            -math.log(self.max_period) * torch.arange(half_dim, device=device) / half_dim
-        )
-        
-        # Compute embeddings
-        args = x.unsqueeze(-1) * freqs.unsqueeze(0)
-        embeddings[:, :half_dim] = torch.sin(args)
-        embeddings[:, half_dim:] = torch.cos(args)
-        
-        return embeddings
+# Import our physics module
+import sys
+sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
+from physics.kmc_physics import KineticMonteCarloPhysics, PhysicsConstraints, DefectEvolutionModel
 
 
 class TrapParameterEncoder(nn.Module):
-    """Encodes trap parameters into a latent representation."""
+    """Encodes trap parameters into a latent representation using PhysicsNeMo's FullyConnected."""
     
     def __init__(
         self,
@@ -95,155 +68,176 @@ class TrapParameterEncoder(nn.Module):
 
 
 class PhysicsInformedEvolution(nn.Module):
-    """Physics-informed temporal evolution module using LSTM."""
+    """Physics-informed temporal evolution module that integrates KMC physics."""
     
     def __init__(
         self,
         state_dim: int = 1,  # defect count
         latent_dim: int = 64,
         hidden_dim: int = 128,
-        num_layers: int = 2
+        num_layers: int = 2,
+        physics_config: Dict
     ):
         super().__init__()
         
-        # Time embedding for cycle information
-        self.time_embedding = SinusoidalPositionalEmbedding(
-            dim=32,
-            max_period=2000  # max cycles
+        self.state_dim = state_dim
+        self.latent_dim = latent_dim
+        
+        # Initialize physics modules
+        self.physics = KineticMonteCarloPhysics(physics_config)
+        self.constraints = PhysicsConstraints()
+        
+        # Physics-based evolution model with neural correction
+        self.evolution_model = DefectEvolutionModel(
+            physics_config=physics_config,
+            use_neural_correction=True
         )
         
-        # Main evolution model - LSTM for temporal dynamics
-        self.temporal_model = nn.LSTM(
-            input_size=state_dim + latent_dim + 32,  # state + device latent + time
+        # RNN for temporal context (captures history dependence)
+        self.temporal_rnn = nn.LSTM(
+            input_size=state_dim + latent_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True
         )
         
-        # Output projection using PhysicsNeMo's FullyConnected
-        self.output_projection = FullyConnected(
-            in_features=hidden_dim,
+        # Fusion network to combine physics and RNN predictions
+        self.fusion_net = FullyConnected(
+            in_features=state_dim + hidden_dim,  # physics pred + RNN output
             out_features=state_dim,
             num_layers=2,
             layer_size=hidden_dim // 2,
-            activation_fn='relu'
-        )
-        
-        # Physics-based generation rate
-        self.generation_rate = nn.Sequential(
-            nn.Linear(latent_dim + 1, hidden_dim),  # device params + current state
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Softplus()  # Ensure positive rate
+            activation_fn='gelu'
         )
         
     def forward(
         self,
         initial_states: torch.Tensor,
         device_latent: torch.Tensor,
+        voltage: torch.Tensor,
+        thickness: torch.Tensor,
+        trap_params: torch.Tensor,
         target_length: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
             initial_states: [batch_size, initial_cycles]
             device_latent: [batch_size, latent_dim]
+            voltage: [batch_size]
+            thickness: [batch_size]
+            trap_params: [batch_size, 8]
             target_length: number of cycles to predict
             
         Returns:
             predictions: [batch_size, target_length]
+            physics_info: Dictionary with physics quantities
         """
         batch_size = initial_states.size(0)
         device = initial_states.device
         
-        # Initialize hidden states
-        h0 = torch.zeros(self.temporal_model.num_layers, batch_size, 
-                        self.temporal_model.hidden_size, device=device)
+        # Initialize hidden states for RNN
+        h0 = torch.zeros(self.temporal_rnn.num_layers, batch_size, 
+                        self.temporal_rnn.hidden_size, device=device)
         c0 = torch.zeros_like(h0)
         hidden = (h0, c0)
         
         predictions = []
+        physics_info_list = []
         
-        # Use last known state as starting point
+        # Start from last known state
         current_state = initial_states[:, -1:]  # [batch_size, 1]
-        
-        # Get initial cycle number
-        initial_cycle = initial_states.size(1)
         
         # Auto-regressive generation
         for t in range(target_length):
-            # Current cycle number
-            cycle_num = initial_cycle + t
-            time_embed = self.time_embedding(
-                torch.tensor([cycle_num], device=device).expand(batch_size)
-            )  # [batch_size, 32]
+            # 1. Physics-based prediction
+            physics_pred, physics_info = self.evolution_model(
+                current_state=current_state,
+                voltage=voltage,
+                thickness=thickness,
+                trap_params=trap_params,
+                time_step=1.0  # One cycle
+            )
             
-            # Prepare input: current state + device params + time
-            lstm_input = torch.cat([
+            # 2. RNN prediction for temporal context
+            rnn_input = torch.cat([
                 current_state,
-                device_latent,
-                time_embed
+                device_latent
             ], dim=-1).unsqueeze(1)  # [batch_size, 1, input_dim]
             
-            # LSTM forward
-            lstm_out, hidden = self.temporal_model(lstm_input, hidden)
-            lstm_out = lstm_out.squeeze(1)  # [batch_size, hidden_dim]
+            rnn_out, hidden = self.temporal_rnn(rnn_input, hidden)
+            rnn_out = rnn_out.squeeze(1)  # [batch_size, hidden_dim]
             
-            # Calculate physics-based generation rate
-            rate_input = torch.cat([device_latent, current_state], dim=-1)
-            generation_rate = self.generation_rate(rate_input)  # [batch_size, 1]
+            # 3. Fuse physics and RNN predictions
+            fusion_input = torch.cat([
+                physics_pred,
+                rnn_out
+            ], dim=-1)
             
-            # Predict state change
-            delta_state = self.output_projection(lstm_out)  # [batch_size, 1]
+            next_state = self.fusion_net(fusion_input)
             
-            # Apply physics constraint: defects can only increase
-            delta_state = F.relu(delta_state)
+            # 4. Apply physics constraints
+            next_state = self.constraints.enforce_monotonicity(
+                torch.cat([current_state, next_state], dim=1)
+            )[:, -1:]
             
-            # Scale by generation rate
-            delta_state = delta_state * generation_rate
-            
-            # Update state
-            next_state = current_state + delta_state
+            next_state = self.constraints.enforce_breakdown_limit(next_state)
             
             predictions.append(next_state)
+            physics_info_list.append(physics_info)
             current_state = next_state
             
         # Stack predictions
         predictions = torch.cat(predictions, dim=1)  # [batch_size, target_length]
         
-        return predictions
+        # Aggregate physics info
+        aggregated_physics_info = {
+            'electric_field': physics_info_list[0]['electric_field'],
+            'generation_rate': torch.stack([p['generation_rate'] for p in physics_info_list], dim=1),
+            'breakdown_prob': torch.stack([p['breakdown_prob'] for p in physics_info_list], dim=1)
+        }
+        
+        return predictions, aggregated_physics_info
 
 
 class BreakdownPredictor(nn.Module):
-    """Predicts breakdown probability based on current state."""
+    """Predicts breakdown probability using physics-informed approach."""
     
     def __init__(
         self,
         state_dim: int = 1,
         latent_dim: int = 64,
         hidden_dim: int = 64,
-        threshold: float = 200.0
+        breakdown_threshold: float = 200.0,
+        critical_density: float = 1e22
     ):
         super().__init__()
-        self.threshold = threshold
+        self.breakdown_threshold = breakdown_threshold
+        self.critical_density = critical_density
         
+        # Neural network for learned breakdown patterns
         self.predictor = FullyConnected(
-            in_features=state_dim + latent_dim + 1,  # state + device params + cycle
+            in_features=state_dim + latent_dim + 2,  # state + device params + field + cycle
             out_features=1,
             num_layers=3,
             layer_size=hidden_dim,
             activation_fn='relu'
         )
         
+        # Physics module for percolation-based breakdown
+        self.physics = KineticMonteCarloPhysics({'constants': {}, 'device': {}})
+        
     def forward(
         self,
         states: torch.Tensor,
         device_latent: torch.Tensor,
+        electric_field: torch.Tensor,
         cycles: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
-            states: [batch_size, seq_len] or [batch_size, seq_len, 1]
+            states: [batch_size, seq_len] defect counts
             device_latent: [batch_size, latent_dim]
+            electric_field: [batch_size] 
             cycles: [batch_size, seq_len]
             
         Returns:
@@ -254,38 +248,45 @@ class BreakdownPredictor(nn.Module):
             
         batch_size, seq_len = states.shape[:2]
         
-        # Expand device latent for all timesteps
-        device_latent_expanded = device_latent.unsqueeze(1).expand(
-            batch_size, seq_len, -1
-        )  # [batch_size, seq_len, latent_dim]
+        # Convert defect count to density (assuming unit volume)
+        defect_density = states.squeeze(-1) * 1e20 / 1e-12  # Convert to cm^-3
         
-        # Normalize cycles
-        cycles_norm = cycles.unsqueeze(-1) / 2000.0  # [batch_size, seq_len, 1]
-        
-        # Concatenate inputs
-        inputs = torch.cat([
-            states,
-            device_latent_expanded,
-            cycles_norm
-        ], dim=-1)  # [batch_size, seq_len, input_dim]
-        
-        # Predict breakdown probability
-        breakdown_logits = self.predictor(inputs).squeeze(-1)  # [batch_size, seq_len]
-        
-        # Add hard threshold
-        hard_breakdown = (states.squeeze(-1) >= self.threshold).float()
-        
-        # Combine learned and hard threshold
-        breakdown_prob = torch.maximum(
-            torch.sigmoid(breakdown_logits),
-            hard_breakdown
+        # Physics-based breakdown probability
+        physics_breakdown_prob = self.physics.breakdown_probability(
+            defect_density, self.critical_density
         )
         
-        return breakdown_prob
+        # Neural network prediction
+        device_latent_expanded = device_latent.unsqueeze(1).expand(
+            batch_size, seq_len, -1
+        )
+        electric_field_expanded = electric_field.unsqueeze(1).expand(
+            batch_size, seq_len
+        ).unsqueeze(-1)
+        cycles_norm = cycles.unsqueeze(-1) / 2000.0
+        
+        nn_inputs = torch.cat([
+            states,
+            device_latent_expanded,
+            electric_field_expanded,
+            cycles_norm
+        ], dim=-1)
+        
+        nn_breakdown_logits = self.predictor(nn_inputs).squeeze(-1)
+        nn_breakdown_prob = torch.sigmoid(nn_breakdown_logits)
+        
+        # Combine physics and learned predictions
+        combined_prob = 0.7 * physics_breakdown_prob + 0.3 * nn_breakdown_prob
+        
+        # Hard threshold override
+        hard_breakdown = (states.squeeze(-1) >= self.breakdown_threshold).float()
+        final_prob = torch.maximum(combined_prob, hard_breakdown)
+        
+        return final_prob
 
 
-class FerroelectricSurrogate(nn.Module):
-    """Main surrogate model for ferroelectric device degradation prediction."""
+class PhysicsInformedFerroelectricSurrogate(nn.Module):
+    """Main physics-informed surrogate model for ferroelectric device degradation."""
     
     def __init__(
         self,
@@ -296,13 +297,24 @@ class FerroelectricSurrogate(nn.Module):
         encoder_layers: int = 3,
         evolution_layers: int = 2,
         breakdown_threshold: float = 200.0,
-        use_fno: bool = False
+        physics_config: Dict = None
     ):
         super().__init__()
         
         self.state_dim = state_dim
         self.breakdown_threshold = breakdown_threshold
-        self.use_fno = use_fno
+        
+        # Default physics config if not provided
+        if physics_config is None:
+            physics_config = {
+                'constants': {
+                    'k_B': 8.617e-5,  # eV/K
+                    'q': 1.602e-19    # C
+                },
+                'device': {
+                    'temperature_default': 300.0  # K
+                }
+            }
         
         # Trap parameter encoder
         self.trap_encoder = TrapParameterEncoder(
@@ -324,20 +336,24 @@ class FerroelectricSurrogate(nn.Module):
         # Combine encodings
         self.combine_latents = nn.Linear(latent_dim + latent_dim // 2, latent_dim)
         
-        # Temporal evolution model
+        # Physics-informed temporal evolution
         self.evolution_model = PhysicsInformedEvolution(
             state_dim=state_dim,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
-            num_layers=evolution_layers
+            num_layers=evolution_layers,
+            physics_config=physics_config
         )
+        
+        # Physics module for field calculation
+        self.physics_constraints = PhysicsConstraints()
             
         # Breakdown predictor
         self.breakdown_predictor = BreakdownPredictor(
             state_dim=state_dim,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim // 2,
-            threshold=breakdown_threshold
+            breakdown_threshold=breakdown_threshold
         )
         
     def encode_device(
@@ -372,7 +388,7 @@ class FerroelectricSurrogate(nn.Module):
         target_length: int = 50
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass of the surrogate model.
+        Forward pass of the physics-informed surrogate model.
         
         Args:
             trap_params: [batch_size, 8]
@@ -387,6 +403,7 @@ class FerroelectricSurrogate(nn.Module):
                 - predictions: [batch_size, target_length] predicted defect counts
                 - breakdown_prob: [batch_size, target_length] breakdown probabilities
                 - device_latent: [batch_size, latent_dim] encoded device representation
+                - physics_info: Dictionary with physics quantities
         """
         batch_size = trap_params.size(0)
         device = trap_params.device
@@ -396,9 +413,19 @@ class FerroelectricSurrogate(nn.Module):
             trap_params, voltage, thickness, pulsewidth, initial_states
         )
         
-        # Generate predictions
-        predictions = self.evolution_model(
-            initial_states, device_latent, target_length
+        # Calculate electric field
+        electric_field = self.physics_constraints.calculate_electric_field(
+            voltage, thickness
+        )
+        
+        # Generate predictions with physics
+        predictions, physics_info = self.evolution_model(
+            initial_states=initial_states,
+            device_latent=device_latent,
+            voltage=voltage,
+            thickness=thickness,
+            trap_params=trap_params,
+            target_length=target_length
         )
             
         # Calculate cycles for each prediction
@@ -411,13 +438,14 @@ class FerroelectricSurrogate(nn.Module):
         
         # Predict breakdown probability
         breakdown_prob = self.breakdown_predictor(
-            predictions, device_latent, cycles
+            predictions, device_latent, electric_field, cycles
         )
         
         return {
             'predictions': predictions,
             'breakdown_prob': breakdown_prob,
-            'device_latent': device_latent
+            'device_latent': device_latent,
+            'physics_info': physics_info
         }
         
     @torch.no_grad()
@@ -432,7 +460,7 @@ class FerroelectricSurrogate(nn.Module):
         breakdown_threshold: float = 0.95
     ) -> Dict[str, torch.Tensor]:
         """
-        Generate full trajectory until breakdown.
+        Generate full trajectory until breakdown using physics.
         
         Args:
             trap_params: [batch_size, 8]
@@ -466,6 +494,11 @@ class FerroelectricSurrogate(nn.Module):
         breakdown_cycles = torch.full((batch_size,), max_cycles, device=device)
         has_broken = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
+        # Calculate electric field once
+        electric_field = self.physics_constraints.calculate_electric_field(
+            voltage, thickness
+        )
+        
         # Generate iteratively
         window_size = 50  # Generate in chunks
         current_cycle = initial_states.size(1)
@@ -475,7 +508,7 @@ class FerroelectricSurrogate(nn.Module):
             remaining = max_cycles - current_cycle
             chunk_size = min(window_size, remaining)
             
-            # Generate next chunk
+            # Generate next chunk with physics
             outputs = self.forward(
                 trap_params, voltage, thickness, pulsewidth,
                 current_states[:, -5:],  # Use last 5 states

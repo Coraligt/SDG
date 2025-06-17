@@ -1,4 +1,4 @@
-# scripts/prepare_data.py
+# prepare_data.py
 
 """
 Prepare and validate the ferroelectric dataset.

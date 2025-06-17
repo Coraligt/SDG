@@ -1,4 +1,4 @@
-# data/datapipes/ferroelectric_dataset.py
+# ferroelectric_dataset.py
 
 import torch
 import torch.nn.functional as F

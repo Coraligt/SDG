@@ -76,7 +76,7 @@ class PhysicsInformedEvolution(nn.Module):
         latent_dim: int = 64,
         hidden_dim: int = 128,
         num_layers: int = 2,
-        physics_config: Dict
+        physics_config: Dict = None 
     ):
         super().__init__()
         

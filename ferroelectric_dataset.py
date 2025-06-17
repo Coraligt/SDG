@@ -49,6 +49,7 @@ class FerroelectricDataset(Dataset):
         self.max_cycles = max_cycles
         self.breakdown_threshold = breakdown_threshold
         self.normalize = normalize
+        self.train = train
         
         # Load and process data
         self.data = self._load_data(data_path)
@@ -56,15 +57,27 @@ class FerroelectricDataset(Dataset):
         # Split train/val
         np.random.seed(seed)
         n_samples = len(self.data)
-        indices = np.random.permutation(n_samples)
+        all_indices = np.random.permutation(n_samples)
         n_train = int(train_split * n_samples)
         
         if train:
-            self.indices = indices[:n_train]
+            self.indices = all_indices[:n_train]
         else:
-            self.indices = indices[n_train:]
+            self.indices = all_indices[n_train:]
             
-        logger.info(f"Dataset initialized with {len(self.indices)} samples ({'train' if train else 'val'})")
+        # Filter out samples that have breakdown before initial_cycles
+        valid_indices = []
+        for idx in self.indices:
+            sample = self._get_raw_sample_by_index(idx)
+            # Check if we have at least initial_cycles of valid data
+            initial_data = sample['defect_evolution'][:self.initial_cycles]
+            if not np.isnan(initial_data).any():
+                valid_indices.append(idx)
+            else:
+                logger.warning(f"Skipping sample {idx} - breakdown occurs before initial cycles")
+        
+        self.indices = np.array(valid_indices)
+        logger.info(f"Dataset initialized with {len(self.indices)} valid samples ({'train' if train else 'val'})")
         
         # Calculate normalization statistics from training data
         if train and normalize:
@@ -90,7 +103,17 @@ class FerroelectricDataset(Dataset):
         for i in range(1, self.max_cycles + 1):
             col_names.append(f"cycle_{i}")
             
-        df.columns = col_names
+        # Only assign names if we have the right number of columns
+        if len(df.columns) == len(col_names):
+            df.columns = col_names
+        else:
+            logger.warning(f"Column count mismatch: expected {len(col_names)}, got {len(df.columns)}")
+            # Use numeric column names for safety
+            basic_cols = ["peak_density", "thermal_ionization_mean", "thermal_ionization_spread", 
+                          "relaxation_energy", "voltage1", "voltage2", "pulsewidth", "thickness"]
+            cycle_cols = [f"cycle_{i}" for i in range(1, len(df.columns) - len(basic_cols) + 1)]
+            df.columns = basic_cols + cycle_cols
+            self.max_cycles = len(cycle_cols)
         
         # Add fixed trap parameters not in CSV
         df['electron_affinity'] = 2.4  # eV
@@ -107,19 +130,21 @@ class FerroelectricDataset(Dataset):
         voltages = []
         cycle_values = []
         
-        for idx in self.indices:
-            sample = self._get_raw_sample(idx)
+        # Use only the indices that belong to this dataset split
+        for i in range(len(self.indices)):
+            sample = self._get_raw_sample(i)
             trap_params.append(sample['trap_parameters'])
             voltages.append(sample['voltage'])
             
             # Collect non-NaN cycle values
             cycles = sample['defect_evolution']
             valid_cycles = cycles[~np.isnan(cycles)]
-            cycle_values.extend(valid_cycles)
+            if len(valid_cycles) > 0:
+                cycle_values.extend(valid_cycles)
             
         trap_params = np.array(trap_params)
         voltages = np.array(voltages)
-        cycle_values = np.array(cycle_values)
+        cycle_values = np.array(cycle_values) if cycle_values else np.array([0.0])
         
         # Calculate statistics
         self.trap_mean = np.mean(trap_params, axis=0)
@@ -132,8 +157,12 @@ class FerroelectricDataset(Dataset):
         self.cycle_std = np.std(cycle_values) + 1e-8
         
         # Handle thickness and pulsewidth
-        thicknesses = self.data.iloc[self.indices]['thickness'].values
-        pulsewidths = self.data.iloc[self.indices]['pulsewidth'].values
+        thicknesses = []
+        pulsewidths = []
+        for i in range(len(self.indices)):
+            idx = self.indices[i]
+            thicknesses.append(self.data.iloc[idx]['thickness'])
+            pulsewidths.append(self.data.iloc[idx]['pulsewidth'])
         
         self.thickness_mean = np.mean(thicknesses)
         self.thickness_std = np.std(thicknesses) + 1e-8
@@ -141,9 +170,9 @@ class FerroelectricDataset(Dataset):
         self.pulsewidth_mean = np.mean(pulsewidths) 
         self.pulsewidth_std = np.std(pulsewidths) + 1e-8
         
-    def _get_raw_sample(self, idx: int) -> Dict:
-        """Get raw sample data."""
-        row = self.data.iloc[self.indices[idx]]
+    def _get_raw_sample_by_index(self, data_idx: int) -> Dict:
+        """Get raw sample data by direct index."""
+        row = self.data.iloc[data_idx]
         
         # Extract trap parameters (8 parameters)
         trap_parameters = np.array([
@@ -164,7 +193,15 @@ class FerroelectricDataset(Dataset):
         
         # Extract defect evolution
         cycle_cols = [f'cycle_{i}' for i in range(1, self.max_cycles + 1)]
-        defect_evolution = row[cycle_cols].values.astype(np.float32)
+        # Filter out columns that don't exist
+        existing_cycle_cols = [col for col in cycle_cols if col in row.index]
+        defect_evolution = row[existing_cycle_cols].values.astype(np.float32)
+        
+        # Pad to max_cycles if necessary
+        if len(defect_evolution) < self.max_cycles:
+            pad_length = self.max_cycles - len(defect_evolution)
+            defect_evolution = np.pad(defect_evolution, (0, pad_length), 
+                                     mode='constant', constant_values=np.nan)
         
         return {
             'trap_parameters': trap_parameters,
@@ -173,6 +210,12 @@ class FerroelectricDataset(Dataset):
             'pulsewidth': pulsewidth,
             'defect_evolution': defect_evolution
         }
+        
+    def _get_raw_sample(self, idx: int) -> Dict:
+        """Get raw sample data."""
+        # Get the actual data index
+        data_idx = self.indices[idx]
+        return self._get_raw_sample_by_index(data_idx)
     
     def _find_breakdown_cycle(self, defect_evolution: np.ndarray) -> int:
         """Find the cycle where breakdown occurs.
@@ -224,10 +267,6 @@ class FerroelectricDataset(Dataset):
         # Extract sequences with proper breakdown handling
         initial_states = sample['defect_evolution'][:self.initial_cycles]
         
-        # Validate initial states don't contain NaN
-        if np.isnan(initial_states).any():
-            raise ValueError(f"Sample {idx}: Initial states contain NaN, which indicates data issue")
-        
         # For target states, extract the next prediction_horizon cycles
         start_idx = self.initial_cycles
         end_idx = min(start_idx + self.prediction_horizon, len(sample['defect_evolution']))
@@ -243,34 +282,39 @@ class FerroelectricDataset(Dataset):
         # Create valid mask - True where we have actual data (not NaN)
         valid_mask = ~np.isnan(target_states)
         
-        # For normalized targets, we need to handle NaN carefully
-        # Only normalize the valid values
-        if self.normalize and hasattr(self, 'cycle_mean'):
-            # Normalize only non-NaN values
-            valid_indices = ~np.isnan(target_states)
-            if valid_indices.any():
-                target_states_norm = target_states.copy()
-                target_states_norm[valid_indices] = (
-                    (target_states[valid_indices] - self.cycle_mean) / self.cycle_std
-                )
-            else:
-                target_states_norm = target_states
-                
-            initial_states_norm = (initial_states - self.cycle_mean) / self.cycle_std
-        else:
-            target_states_norm = target_states
-            initial_states_norm = initial_states
+        # For training, we keep the actual values where valid, and use a sentinel value for NaN
+        # This sentinel value should be the breakdown threshold since that's the physical limit
+        target_states_for_training = target_states.copy()
+        target_states_for_training[np.isnan(target_states_for_training)] = self.breakdown_threshold
+        
         # Normalize if required
         if self.normalize and hasattr(self, 'trap_mean'):
             trap_params_norm = (sample['trap_parameters'] - self.trap_mean) / self.trap_std
             voltage_norm = (sample['voltage'] - self.voltage_mean) / self.voltage_std
             thickness_norm = (sample['thickness'] - self.thickness_mean) / self.thickness_std
             pulsewidth_norm = (sample['pulsewidth'] - self.pulsewidth_mean) / self.pulsewidth_std
+            initial_states_norm = (initial_states - self.cycle_mean) / self.cycle_std
+            
+            # Only normalize valid target values
+            target_states_norm = target_states_for_training.copy()
+            if valid_mask.any():
+                valid_indices = valid_mask
+                target_states_norm[valid_indices] = (
+                    (target_states_for_training[valid_indices] - self.cycle_mean) / self.cycle_std
+                )
+                # For invalid indices (after breakdown), use normalized breakdown threshold
+                invalid_indices = ~valid_mask
+                if invalid_indices.any():
+                    target_states_norm[invalid_indices] = (
+                        (self.breakdown_threshold - self.cycle_mean) / self.cycle_std
+                    )
         else:
             trap_params_norm = sample['trap_parameters']
             voltage_norm = sample['voltage']
             thickness_norm = sample['thickness']
             pulsewidth_norm = sample['pulsewidth']
+            initial_states_norm = initial_states
+            target_states_norm = target_states_for_training
             
         return {
             'trap_parameters': torch.tensor(trap_params_norm, dtype=torch.float32),
@@ -278,8 +322,8 @@ class FerroelectricDataset(Dataset):
             'thickness': torch.tensor(thickness_norm, dtype=torch.float32),
             'pulsewidth': torch.tensor(pulsewidth_norm, dtype=torch.float32),
             'initial_states': torch.tensor(initial_states_norm, dtype=torch.float32),
-            'target_states': torch.tensor(target_states_norm, dtype=torch.float32),  # May contain NaN
-            'valid_mask': torch.tensor(valid_mask, dtype=torch.float32),
+            'target_states': torch.tensor(target_states_norm, dtype=torch.float32),
+            'valid_mask': torch.tensor(valid_mask, dtype=torch.bool),
             'breakdown_cycle': torch.tensor(breakdown_cycle, dtype=torch.long),
         }
 

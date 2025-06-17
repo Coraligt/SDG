@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List  # Make sure Dict is imported!
 import numpy as np
 import math
 
@@ -76,12 +76,24 @@ class PhysicsInformedEvolution(nn.Module):
         latent_dim: int = 64,
         hidden_dim: int = 128,
         num_layers: int = 2,
-        physics_config: Dict = None 
+        physics_config: Dict = None  # Can also provide default value
     ):
         super().__init__()
         
         self.state_dim = state_dim
         self.latent_dim = latent_dim
+        
+        # Default physics config if not provided
+        if physics_config is None:
+            physics_config = {
+                'constants': {
+                    'k_B': 8.617e-5,  # eV/K
+                    'q': 1.602e-19    # C
+                },
+                'device': {
+                    'temperature_default': 300.0  # K
+                }
+            }
         
         # Initialize physics modules
         self.physics = KineticMonteCarloPhysics(physics_config)
@@ -224,7 +236,15 @@ class BreakdownPredictor(nn.Module):
         )
         
         # Physics module for percolation-based breakdown
-        self.physics = KineticMonteCarloPhysics({'constants': {}, 'device': {}})
+        self.physics = KineticMonteCarloPhysics({
+            'constants': {
+                'k_B': 8.617e-5,  # eV/K
+                'q': 1.602e-19    # C
+            },
+            'device': {
+                'temperature_default': 300.0  # K
+            }
+        })
         
     def forward(
         self,
@@ -297,7 +317,7 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
         encoder_layers: int = 3,
         evolution_layers: int = 2,
         breakdown_threshold: float = 200.0,
-        physics_config: Dict = None
+        physics_config: Optional[Dict] = None  # Using Optional[Dict] is also good practice
     ):
         super().__init__()
         

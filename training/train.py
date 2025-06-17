@@ -20,7 +20,7 @@ import sys
 sys.path.append('/storage/home/hcoda1/6/cli872/scratch/work/SDG')
 
 from ferroelectric_dataset import create_dataloaders
-from models.fe_surrogate_physics import PhysicsInformedFerroelectricSurrogate
+from models.fe_surrogate import PhysicsInformedFerroelectricSurrogate
 from models.losses import PhysicsInformedLoss, GenerationRateLoss, CycleLoss
 
 

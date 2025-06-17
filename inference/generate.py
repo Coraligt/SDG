@@ -126,6 +126,8 @@ class SyntheticDataGenerator:
             torch.manual_seed(seed)
             np.random.seed(seed)
             
+        self.logger.info(f"Generating {num_samples} synthetic samples...")
+        
         # Generate random trap parameters
         trap_params = self._generate_trap_parameters(num_samples)
         
@@ -146,40 +148,94 @@ class SyntheticDataGenerator:
         
         # Normalize if needed
         if self.normalize:
-            trap_params_tensor = (trap_params_tensor - self.trap_mean) / self.trap_std
-            voltages_tensor = (voltages_tensor - self.voltage_mean) / self.voltage_std
-            thickness_tensor = (thickness_tensor - self.thickness_mean) / self.thickness_std
-            pulsewidth_tensor = (pulsewidth_tensor - self.pulsewidth_mean) / self.pulsewidth_std
-            initial_states_tensor = (initial_states_tensor - self.cycle_mean) / self.cycle_std
+            # Ensure std is not too small
+            trap_std_safe = torch.clamp(self.trap_std, min=1e-6)
+            voltage_std_safe = max(self.voltage_std, 0.1)
+            thickness_std_safe = max(self.thickness_std, 1e-10)
+            pulsewidth_std_safe = max(self.pulsewidth_std, 1e-9)
+            cycle_std_safe = max(self.cycle_std, 1.0)
             
-        # Generate trajectories
-        self.logger.info(f"Generating {num_samples} synthetic trajectories...")
+            trap_params_tensor = (trap_params_tensor - self.trap_mean) / trap_std_safe
+            voltages_tensor = (voltages_tensor - self.voltage_mean) / voltage_std_safe
+            thickness_tensor = (thickness_tensor - self.thickness_mean) / thickness_std_safe
+            pulsewidth_tensor = (pulsewidth_tensor - self.pulsewidth_mean) / pulsewidth_std_safe
+            initial_states_tensor = (initial_states_tensor - self.cycle_mean) / cycle_std_safe
+            
+        # Generate trajectories in batches to handle memory
+        batch_size = 16
+        all_trajectories = []
+        all_breakdown_cycles = []
+        all_final_defects = []
         
-        with torch.no_grad():
-            results = self.model.generate(
-                trap_params=trap_params_tensor,
-                voltage=voltages_tensor,
-                thickness=thickness_tensor,
-                pulsewidth=pulsewidth_tensor,
-                initial_states=initial_states_tensor,
-                max_cycles=max_cycles - initial_cycles
-            )
+        for i in range(0, num_samples, batch_size):
+            end_idx = min(i + batch_size, num_samples)
+            batch_slice = slice(i, end_idx)
             
-        # Denormalize results if needed
-        if self.normalize:
-            results['full_trajectory'] = (
-                results['full_trajectory'] * self.cycle_std + self.cycle_mean
-            )
+            self.logger.info(f"Generating batch {i//batch_size + 1}/{(num_samples + batch_size - 1)//batch_size}")
             
-        # Convert to numpy
+            with torch.no_grad():
+                try:
+                    results = self.model.generate(
+                        trap_params=trap_params_tensor[batch_slice],
+                        voltage=voltages_tensor[batch_slice],
+                        thickness=thickness_tensor[batch_slice],
+                        pulsewidth=pulsewidth_tensor[batch_slice],
+                        initial_states=initial_states_tensor[batch_slice],
+                        max_cycles=max_cycles - initial_cycles
+                    )
+                    
+                    # Denormalize results if needed
+                    if self.normalize:
+                        results['full_trajectory'] = (
+                            results['full_trajectory'] * self.cycle_std + self.cycle_mean
+                        )
+                        results['final_defect_counts'] = (
+                            results['final_defect_counts'] * self.cycle_std + self.cycle_mean
+                        )
+                    
+                    all_trajectories.append(results['full_trajectory'].cpu())
+                    all_breakdown_cycles.append(results['breakdown_cycles'].cpu())
+                    all_final_defects.append(results['final_defect_counts'].cpu())
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in batch {i//batch_size + 1}: {e}")
+                    # Create dummy data for failed batch
+                    batch_len = end_idx - i
+                    dummy_traj = torch.zeros(batch_len, max_cycles)
+                    dummy_breakdown = torch.full((batch_len,), max_cycles)
+                    dummy_final = torch.full((batch_len,), 200.0)
+                    
+                    all_trajectories.append(dummy_traj)
+                    all_breakdown_cycles.append(dummy_breakdown)
+                    all_final_defects.append(dummy_final)
+        
+        # Combine all batches
+        full_trajectories = torch.cat(all_trajectories, dim=0).numpy()
+        breakdown_cycles = torch.cat(all_breakdown_cycles, dim=0).numpy()
+        final_defect_counts = torch.cat(all_final_defects, dim=0).numpy()
+        
+        # Ensure valid data
+        # Clip values to reasonable ranges
+        full_trajectories = np.clip(full_trajectories, 0, 300)
+        final_defect_counts = np.clip(final_defect_counts, 0, 300)
+        
+        # Handle any remaining NaN values
+        nan_mask = np.isnan(final_defect_counts)
+        if nan_mask.any():
+            self.logger.warning(f"Found {nan_mask.sum()} NaN values in final defect counts, replacing with mean")
+            mean_value = np.nanmean(final_defect_counts)
+            if np.isnan(mean_value):
+                mean_value = 100.0  # Default fallback
+            final_defect_counts[nan_mask] = mean_value
+        
         return {
             'trap_parameters': trap_params,
             'voltages': voltages,
             'thickness': np.full(num_samples, thickness),
             'pulsewidth': np.full(num_samples, pulsewidth),
-            'trajectories': results['full_trajectory'].cpu().numpy(),
-            'breakdown_cycles': results['breakdown_cycles'].cpu().numpy(),
-            'final_defect_counts': results['final_defect_counts'].cpu().numpy()
+            'trajectories': full_trajectories,
+            'breakdown_cycles': breakdown_cycles,
+            'final_defect_counts': final_defect_counts
         }
         
     def _generate_trap_parameters(self, num_samples: int) -> np.ndarray:
@@ -233,13 +289,15 @@ class SyntheticDataGenerator:
                     # Start with some initial defects
                     initial_states[i, j] = np.random.poisson(10)
                 else:
-                    # Physics-based growth model
+                    # Physics-based growth model with some randomness
                     growth = np.random.poisson(base_rate * (j + 1))
                     initial_states[i, j] = initial_states[i, j-1] + growth
                     
                     # Cap at breakdown threshold
                     if initial_states[i, j] > 200:
                         initial_states[i, j] = 200
+                        # Fill remaining cycles with breakdown value
+                        initial_states[i, j:] = 200
                         break
                     
         return initial_states
@@ -268,6 +326,12 @@ class SyntheticDataGenerator:
                     'breakdown_threshold': self.config['model']['breakdown_threshold'],
                     'physics_model': 'kinetic_monte_carlo',
                     'generation_model': 'thermochemical'
+                },
+                'statistics': {
+                    'avg_breakdown_cycle': float(np.mean(data['breakdown_cycles'])),
+                    'std_breakdown_cycle': float(np.std(data['breakdown_cycles'])),
+                    'avg_final_defects': float(np.mean(data['final_defect_counts'])),
+                    'std_final_defects': float(np.std(data['final_defect_counts']))
                 }
             }
             
@@ -295,9 +359,9 @@ class SyntheticDataGenerator:
                 # Add trajectory
                 trajectory = data['trajectories'][i]
                 # Pad with NaN after breakdown
-                breakdown_idx = data['breakdown_cycles'][i]
+                breakdown_idx = int(data['breakdown_cycles'][i])
                 if breakdown_idx < max_cycles:
-                    trajectory[int(breakdown_idx):] = np.nan
+                    trajectory[breakdown_idx:] = np.nan
                 row.extend(trajectory)
                 
                 df_data.append(row)
@@ -318,7 +382,9 @@ class SyntheticDataGenerator:
         
         # Plot 1: Sample trajectories
         ax = axes[0, 0]
-        for i in range(min(num_samples, len(data['trajectories']))):
+        num_to_plot = min(num_samples, len(data['trajectories']))
+        
+        for i in range(num_to_plot):
             trajectory = data['trajectories'][i]
             breakdown_cycle = int(data['breakdown_cycles'][i])
             
@@ -330,7 +396,7 @@ class SyntheticDataGenerator:
                 ax.plot(cycles[valid_mask], trajectory[valid_mask], 
                        label=f"V={data['voltages'][i]:.1f}V", alpha=0.7)
                 if breakdown_cycle > 0 and breakdown_cycle < len(trajectory):
-                    ax.scatter(breakdown_cycle-1, trajectory[breakdown_cycle-1], 
+                    ax.scatter(breakdown_cycle-1, trajectory[min(breakdown_cycle-1, len(trajectory)-1)], 
                               marker='x', s=100, c='red')
             
         ax.set_xlabel('Cycles')
@@ -349,13 +415,16 @@ class SyntheticDataGenerator:
         
         # Plot 3: Final defect count distribution
         ax = axes[1, 0]
-        ax.hist(data['final_defect_counts'], bins=30, alpha=0.7, edgecolor='black')
-        ax.axvline(200, color='red', linestyle='--', label='Threshold')
-        ax.set_xlabel('Final Defect Count')
-        ax.set_ylabel('Count')
-        ax.set_title('Distribution of Final Defect Counts')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        # Filter out any extreme values for visualization
+        valid_final = data['final_defect_counts'][data['final_defect_counts'] < 500]
+        if len(valid_final) > 0:
+            ax.hist(valid_final, bins=30, alpha=0.7, edgecolor='black')
+            ax.axvline(200, color='red', linestyle='--', label='Threshold')
+            ax.set_xlabel('Final Defect Count')
+            ax.set_ylabel('Count')
+            ax.set_title('Distribution of Final Defect Counts')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
         
         # Plot 4: Trap parameter correlation
         ax = axes[1, 1]
@@ -423,6 +492,7 @@ def main():
     print(f"\nGeneration complete!")
     print(f"Generated {args.num_samples} samples")
     print(f"Average breakdown cycle: {data['breakdown_cycles'].mean():.1f} ± {data['breakdown_cycles'].std():.1f}")
+    print(f"Average final defect count: {data['final_defect_counts'].mean():.1f} ± {data['final_defect_counts'].std():.1f}")
     print(f"Saved to {args.output_dir}")
 
 

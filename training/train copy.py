@@ -9,12 +9,10 @@ import yaml
 import logging
 from tqdm import tqdm
 import numpy as np
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 import os
 import wandb
-import matplotlib.pyplot as plt
 import pickle
-from datetime import datetime
 
 # PhysicsNeMo imports 
 from physicsnemo.distributed import DistributedManager
@@ -28,225 +26,14 @@ from models.fe_surrogate import PhysicsInformedFerroelectricSurrogate
 from models.losses import PhysicsInformedLoss, GenerationRateLoss, CycleLoss
 
 
-class MetricsTracker:
-    """Track and visualize training metrics."""
-    
-    def __init__(self, save_dir: str):
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize metric storage
-        self.metrics = {
-            'train': {
-                'loss': [],
-                'prediction': [],
-                'breakdown': [],
-                'monotonic': [],
-                'smoothness': [],
-                'physics': [],
-                'generation': [],
-                'cycle': [],
-                'epoch_time': []
-            },
-            'val': {
-                'loss': [],
-                'prediction': [],
-                'breakdown': [],
-                'monotonic': [],
-                'smoothness': [],
-                'physics': [],
-                'generation': [],
-                'cycle': [],
-                'breakdown_mae': [],
-                'final_defect_mae': []
-            },
-            'predictions': {
-                'epochs': [],
-                'samples': []  # Will store sample predictions at key epochs
-            }
-        }
-        
-    def update_train_metrics(self, epoch: int, metrics: Dict, epoch_time: float):
-        """Update training metrics."""
-        self.metrics['train']['epoch_time'].append(epoch_time)
-        for key, value in metrics.items():
-            if key in self.metrics['train']:
-                self.metrics['train'][key].append(value)
-                
-    def update_val_metrics(self, epoch: int, metrics: Dict):
-        """Update validation metrics."""
-        for key, value in metrics.items():
-            if key in self.metrics['val']:
-                self.metrics['val'][key].append(value)
-                
-    def save_predictions(self, epoch: int, predictions: Dict):
-        """Save sample predictions for visualization."""
-        self.metrics['predictions']['epochs'].append(epoch)
-        self.metrics['predictions']['samples'].append(predictions)
-        
-    def plot_losses(self):
-        """Plot training and validation losses."""
-        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-        axes = axes.flatten()
-        
-        # Loss components to plot
-        components = ['loss', 'prediction', 'breakdown', 'monotonic', 
-                     'smoothness', 'physics', 'generation', 'cycle']
-        
-        for idx, component in enumerate(components):
-            ax = axes[idx]
-            
-            # Plot train and val
-            if component in self.metrics['train'] and self.metrics['train'][component]:
-                epochs = range(1, len(self.metrics['train'][component]) + 1)
-                ax.plot(epochs, self.metrics['train'][component], 
-                       'b-', label='Train', alpha=0.8)
-                
-            if component in self.metrics['val'] and self.metrics['val'][component]:
-                epochs = range(1, len(self.metrics['val'][component]) + 1)
-                ax.plot(epochs, self.metrics['val'][component], 
-                       'r-', label='Val', alpha=0.8)
-                
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel(component.capitalize())
-            ax.set_title(f'{component.capitalize()} Loss')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-        plt.tight_layout()
-        plt.savefig(self.save_dir / 'loss_curves.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-    def plot_validation_metrics(self):
-        """Plot additional validation metrics."""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        
-        epochs = range(1, len(self.metrics['val']['breakdown_mae']) + 1)
-        
-        # Breakdown MAE
-        ax1.plot(epochs, self.metrics['val']['breakdown_mae'], 'g-', linewidth=2)
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Breakdown Cycle MAE')
-        ax1.set_title('Breakdown Prediction Error')
-        ax1.grid(True, alpha=0.3)
-        
-        # Final defect MAE
-        ax2.plot(epochs, self.metrics['val']['final_defect_mae'], 'm-', linewidth=2)
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Final Defect Count MAE')
-        ax2.set_title('Final Defect Prediction Error')
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.save_dir / 'validation_metrics.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-    def save_metrics(self):
-        """Save metrics to file."""
-        with open(self.save_dir / 'training_metrics.pkl', 'wb') as f:
-            pickle.dump(self.metrics, f)
-            
-        # Also save as JSON for easy viewing
-        import json
-        
-        # Convert numpy values to Python native types
-        json_metrics = {}
-        for split in ['train', 'val']:
-            json_metrics[split] = {}
-            for key, values in self.metrics[split].items():
-                if isinstance(values, list) and values:
-                    json_metrics[split][key] = [float(v) if isinstance(v, (np.ndarray, np.generic)) else v for v in values]
-                    
-        with open(self.save_dir / 'training_metrics.json', 'w') as f:
-            json.dump(json_metrics, f, indent=2)
-
-
-class PredictionVisualizer:
-    """Visualize model predictions during training."""
-    
-    def __init__(self, save_dir: str):
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-    def visualize_predictions(
-        self, 
-        epoch: int,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        breakdown_prob: torch.Tensor,
-        valid_mask: torch.Tensor,
-        voltages: torch.Tensor,
-        sample_indices: List[int] = None
-    ):
-        """Visualize predictions vs targets for selected samples."""
-        
-        if sample_indices is None:
-            # Select 6 random samples
-            batch_size = predictions.size(0)
-            sample_indices = np.random.choice(batch_size, min(6, batch_size), replace=False)
-            
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        axes = axes.flatten()
-        
-        for idx, sample_idx in enumerate(sample_indices):
-            ax = axes[idx]
-            
-            # Get data for this sample
-            pred = predictions[sample_idx].cpu().numpy()
-            target = targets[sample_idx].cpu().numpy()
-            mask = valid_mask[sample_idx].cpu().numpy()
-            breakdown = breakdown_prob[sample_idx].cpu().numpy()
-            voltage = voltages[sample_idx].cpu().item()
-            
-            # Plot only valid timesteps
-            timesteps = np.arange(len(pred))
-            valid_timesteps = timesteps[mask]
-            
-            if len(valid_timesteps) > 0:
-                # Plot predictions and targets
-                ax.plot(valid_timesteps, target[mask], 'b-', label='Target', linewidth=2)
-                ax.plot(valid_timesteps, pred[mask], 'r--', label='Prediction', linewidth=2, alpha=0.8)
-                
-                # Add breakdown probability on secondary axis
-                ax2 = ax.twinx()
-                ax2.plot(timesteps, breakdown, 'g:', label='Breakdown Prob', alpha=0.6)
-                ax2.set_ylabel('Breakdown Probability', color='g')
-                ax2.tick_params(axis='y', labelcolor='g')
-                ax2.set_ylim([0, 1.1])
-                
-                # Find breakdown point
-                breakdown_idx = np.where(~mask)[0]
-                if len(breakdown_idx) > 0:
-                    breakdown_cycle = breakdown_idx[0]
-                    ax.axvline(breakdown_cycle, color='red', linestyle=':', alpha=0.5, label='Breakdown')
-                
-            ax.set_xlabel('Cycles')
-            ax.set_ylabel('Defect Count')
-            ax.set_title(f'Sample {sample_idx}, V={voltage:.2f}V')
-            ax.legend(loc='upper left')
-            ax.grid(True, alpha=0.3)
-            
-        plt.suptitle(f'Predictions vs Targets - Epoch {epoch}', fontsize=16)
-        plt.tight_layout()
-        plt.savefig(self.save_dir / f'predictions_epoch_{epoch:03d}.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        return fig
-
-
 class Trainer:
-    """Enhanced trainer with comprehensive metrics tracking and visualization."""
+    """Trainer for ferroelectric surrogate model."""
     
     def __init__(self, config: Dict):
         self.config = config
         
         # Setup logging first
         self.setup_logging()
-        
-        # Setup metrics tracking
-        self.metrics_dir = Path(config['training']['checkpoint_dir']) / 'metrics'
-        self.metrics_tracker = MetricsTracker(self.metrics_dir)
-        self.prediction_visualizer = PredictionVisualizer(self.metrics_dir / 'predictions')
         
         # Check if we're in a distributed environment
         self.is_distributed = self._check_distributed_env()
@@ -284,12 +71,6 @@ class Trainer:
             num_workers=config['data']['num_workers']
         )
         
-        # Log dataset statistics
-        self.logger.info(f"Training samples: {len(self.train_loader.dataset)}")
-        self.logger.info(f"Validation samples: {len(self.val_loader.dataset)}")
-        self.logger.info(f"Batch size: {config['training']['batch_size']}")
-        self.logger.info(f"Training batches per epoch: {len(self.train_loader)}")
-        
         # Create optimizer and scheduler
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
@@ -309,7 +90,6 @@ class Trainer:
         # Setup tracking
         self.current_epoch = 0
         self.best_val_loss = float('inf')
-        self.best_breakdown_mae = float('inf')
         
         # Initialize LaunchLogger (handles both distributed and single GPU)
         LaunchLogger.initialize(
@@ -431,9 +211,6 @@ class Trainer:
         """Train for one epoch."""
         self.model.train()
         
-        import time
-        epoch_start_time = time.time()
-        
         with LaunchLogger(
             "train", 
             epoch=self.current_epoch, 
@@ -449,7 +226,7 @@ class Trainer:
                 'monotonic': 0.0,
                 'smoothness': 0.0,
                 'physics': 0.0,
-                'boundary': 0.0,
+                'boundary': 0.0,  # Added missing key
                 'generation': 0.0,
                 'cycle': 0.0
             }
@@ -569,14 +346,11 @@ class Trainer:
             else:
                 self.logger.error("No valid batches in epoch!")
                 
-        epoch_time = time.time() - epoch_start_time
-        epoch_losses['epoch_time'] = epoch_time
-        
         return epoch_losses
         
     @torch.no_grad()
     def validate(self):
-        """Validate the model and save sample predictions."""
+        """Validate the model."""
         self.model.eval()
         
         with LaunchLogger(
@@ -594,7 +368,7 @@ class Trainer:
                 'monotonic': 0.0,
                 'smoothness': 0.0,
                 'physics': 0.0,
-                'boundary': 0.0,
+                'boundary': 0.0,  # Added missing key
                 'generation': 0.0,
                 'cycle': 0.0
             }
@@ -603,19 +377,10 @@ class Trainer:
             breakdown_errors = []
             final_defect_errors = []
             
-            # Store samples for visualization
-            sample_predictions = {
-                'predictions': [],
-                'targets': [],
-                'breakdown_prob': [],
-                'valid_mask': [],
-                'voltages': []
-            }
-            
             disable_progress = self.is_distributed and self.dist_manager and self.dist_manager.rank != 0
             num_batches = 0
             
-            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation", disable=disable_progress)):
+            for batch in tqdm(self.val_loader, desc="Validation", disable=disable_progress):
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                         for k, v in batch.items()}
                 
@@ -710,14 +475,6 @@ class Trainer:
                     final_error = torch.abs(final_predictions - final_targets).mean()
                     final_defect_errors.append(final_error.item())
                     
-                # Store first batch for visualization
-                if batch_idx == 0:
-                    sample_predictions['predictions'] = outputs['predictions']
-                    sample_predictions['targets'] = batch['target_states']
-                    sample_predictions['breakdown_prob'] = outputs['breakdown_prob']
-                    sample_predictions['valid_mask'] = batch['valid_mask']
-                    sample_predictions['voltages'] = batch['voltage']
-                    
             # Average losses
             if num_batches > 0:
                 for key in val_losses:
@@ -735,17 +492,6 @@ class Trainer:
                 'final_defect_mae': val_losses['final_defect_mae']
             })
             
-            # Visualize predictions
-            if sample_predictions['predictions'] is not None:
-                self.prediction_visualizer.visualize_predictions(
-                    epoch=self.current_epoch,
-                    predictions=sample_predictions['predictions'],
-                    targets=sample_predictions['targets'],
-                    breakdown_prob=sample_predictions['breakdown_prob'],
-                    valid_mask=sample_predictions['valid_mask'],
-                    voltages=sample_predictions['voltages']
-                )
-            
         return val_losses
         
     def save_checkpoint(self, filename: str):
@@ -756,9 +502,7 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_val_loss': self.best_val_loss,
-            'best_breakdown_mae': self.best_breakdown_mae,
-            'config': self.config,
-            'metrics': self.metrics_tracker.metrics  # Save all tracked metrics
+            'config': self.config
         }
         
         checkpoint_path = Path(self.config['training']['checkpoint_dir']) / filename
@@ -778,11 +522,6 @@ class Trainer:
             
         self.current_epoch = checkpoint['epoch']
         self.best_val_loss = checkpoint['best_val_loss']
-        self.best_breakdown_mae = checkpoint.get('best_breakdown_mae', float('inf'))
-        
-        # Load metrics history if available
-        if 'metrics' in checkpoint:
-            self.metrics_tracker.metrics = checkpoint['metrics']
         
         self.rank_zero_logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
         
@@ -791,12 +530,6 @@ class Trainer:
         self.rank_zero_logger.info("Starting training...")
         self.rank_zero_logger.info(f"Device: {self.device}")
         self.rank_zero_logger.info(f"Distributed: {self.is_distributed}")
-        
-        # Training summary
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.rank_zero_logger.info(f"Total parameters: {total_params:,}")
-        self.rank_zero_logger.info(f"Trainable parameters: {trainable_params:,}")
         
         for epoch in range(self.current_epoch, self.config['training']['num_epochs']):
             self.current_epoch = epoch
@@ -811,10 +544,6 @@ class Trainer:
             if self.scheduler:
                 self.scheduler.step()
                 
-            # Track metrics
-            self.metrics_tracker.update_train_metrics(epoch, train_losses, train_losses.get('epoch_time', 0))
-            self.metrics_tracker.update_val_metrics(epoch, val_losses)
-            
             # Log metrics
             self.log_metrics(train_losses, val_losses)
             
@@ -823,27 +552,10 @@ class Trainer:
                 self.best_val_loss = val_losses['total']
                 self.save_checkpoint('best_model.pt')
                 
-            if val_losses['breakdown_mae'] < self.best_breakdown_mae:
-                self.best_breakdown_mae = val_losses['breakdown_mae']
-                self.save_checkpoint('best_breakdown_model.pt')
-                
             if (epoch + 1) % self.config['training']['save_every'] == 0:
                 self.save_checkpoint(f'model_epoch_{epoch + 1}.pt')
                 
-            # Save plots every 10 epochs
-            if (epoch + 1) % 10 == 0:
-                self.metrics_tracker.plot_losses()
-                self.metrics_tracker.plot_validation_metrics()
-                self.metrics_tracker.save_metrics()
-                
-        # Final plots and metrics save
-        self.metrics_tracker.plot_losses()
-        self.metrics_tracker.plot_validation_metrics()
-        self.metrics_tracker.save_metrics()
-        
         self.rank_zero_logger.info("Training completed!")
-        self.rank_zero_logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
-        self.rank_zero_logger.info(f"Best breakdown MAE: {self.best_breakdown_mae:.2f} cycles")
         
     def log_metrics(self, train_losses: Dict, val_losses: Dict):
         """Log metrics to tensorboard and console."""
@@ -852,16 +564,14 @@ class Trainer:
             f"Epoch {self.current_epoch}: "
             f"Train Loss = {train_losses['total']:.4f}, "
             f"Val Loss = {val_losses['total']:.4f}, "
-            f"Val Breakdown MAE = {val_losses['breakdown_mae']:.2f} cycles, "
-            f"Time = {train_losses.get('epoch_time', 0):.2f}s"
+            f"Val Breakdown MAE = {val_losses['breakdown_mae']:.2f} cycles"
         )
         
         # Tensorboard logging (always write in single GPU, only rank 0 in distributed)
         should_write = not self.is_distributed or (self.dist_manager and self.dist_manager.rank == 0)
         if should_write:
             for key, value in train_losses.items():
-                if key != 'epoch_time':
-                    self.writer.add_scalar(f'train/{key}', value, self.current_epoch)
+                self.writer.add_scalar(f'train/{key}', value, self.current_epoch)
                 
             for key, value in val_losses.items():
                 self.writer.add_scalar(f'val/{key}', value, self.current_epoch)

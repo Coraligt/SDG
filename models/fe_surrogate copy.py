@@ -124,15 +124,12 @@ class PhysicsInformedEvolution(nn.Module):
         
         # Fusion network to combine physics and RNN predictions
         self.fusion_net = FullyConnected(
-            in_features=state_dim + hidden_dim,
+            in_features=state_dim + hidden_dim,  # physics pred (1) + RNN output (hidden_dim)
             out_features=state_dim,
             num_layers=2,
             layer_size=hidden_dim // 2,
             activation_fn='gelu'
         )
-        
-        # Add output activation to ensure positive defect counts
-        self.output_activation = nn.Softplus()
         
     def forward(
         self,
@@ -186,9 +183,15 @@ class PhysicsInformedEvolution(nn.Module):
             if physics_pred.ndim == 1:
                 physics_pred = physics_pred.unsqueeze(-1)
             elif physics_pred.ndim == 3:
+                # If it's [batch_size, 1, 1], squeeze the last dimension
                 physics_pred = physics_pred.squeeze(-1)
                 
             # 2. RNN prediction for temporal context
+            # Prepare RNN input - ensure proper dimensions
+            # current_state is [batch_size, 1], device_latent is [batch_size, latent_dim]
+            # We need to create [batch_size, 1, 1+latent_dim] for LSTM input
+            
+            # First ensure device_latent is 2D
             if device_latent.ndim == 1:
                 device_latent = device_latent.unsqueeze(0)
                 
@@ -205,20 +208,19 @@ class PhysicsInformedEvolution(nn.Module):
             rnn_out = rnn_out.squeeze(1)  # [batch_size, hidden_dim]
             
             # 3. Fuse physics and RNN predictions
+            # Ensure both tensors are 2D before concatenation
             if physics_pred.ndim == 3:
-                physics_pred = physics_pred.squeeze(1)
+                physics_pred = physics_pred.squeeze(1)  # Remove extra dimension
             if physics_pred.ndim == 1:
                 physics_pred = physics_pred.unsqueeze(-1)
                 
+            # Now concatenate 2D tensors
             fusion_input = torch.cat([
                 physics_pred,    # [batch_size, 1]
                 rnn_out         # [batch_size, hidden_dim]
-            ], dim=-1)
+            ], dim=-1)  # [batch_size, 1 + hidden_dim]
             
             next_state = self.fusion_net(fusion_input)  # [batch_size, state_dim]
-            
-            # Apply output activation to ensure positive values
-            next_state = self.output_activation(next_state)
             
             # Ensure next_state has correct shape [batch_size, 1]
             if next_state.ndim == 1:
@@ -387,12 +389,13 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
             num_layers=encoder_layers
         )
         
-        # Initial state encoder - now handles variable length sequences
-        self.initial_state_encoder = nn.LSTM(
-            input_size=state_dim,
-            hidden_size=latent_dim // 2,
+        # Initial state encoder - handle variable initial cycles
+        self.initial_state_encoder = FullyConnected(
+            in_features=state_dim * 5,  # Assuming max 5 initial cycles
+            out_features=latent_dim // 2,
             num_layers=2,
-            batch_first=True
+            layer_size=hidden_dim // 2,
+            activation_fn='gelu'
         )
         
         # Combine encodings
@@ -430,17 +433,19 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
         # Encode trap parameters
         trap_latent = self.trap_encoder(trap_params, voltage, thickness, pulsewidth)
         
-        # Encode initial states with LSTM
-        batch_size = initial_states.size(0)
+        # Encode initial states - pad or truncate to fixed size
+        batch_size, initial_cycles = initial_states.shape
         
-        # Reshape for LSTM: [batch_size, seq_len, 1]
-        initial_states_seq = initial_states.unsqueeze(-1)
-        
-        # Process with LSTM
-        _, (h_n, _) = self.initial_state_encoder(initial_states_seq)
-        
-        # Take the last hidden state from the last layer
-        initial_latent = h_n[-1]  # [batch_size, latent_dim // 2]
+        if initial_cycles < 5:
+            # Pad with zeros
+            padding = torch.zeros(batch_size, 5 - initial_cycles, device=initial_states.device)
+            initial_padded = torch.cat([initial_states, padding], dim=1)
+        else:
+            # Take last 5 cycles
+            initial_padded = initial_states[:, -5:]
+            
+        initial_flat = initial_padded.flatten(start_dim=1)
+        initial_latent = self.initial_state_encoder(initial_flat)
         
         # Combine latents
         combined = torch.cat([trap_latent, initial_latent], dim=-1)
@@ -578,8 +583,11 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
             remaining = max_cycles - current_cycle
             chunk_size = min(window_size, remaining)
             
-            # Use last states as input
-            input_states = current_states[:, -min(10, current_states.size(1)):]
+            # Use last 5 states or all available states
+            if current_states.size(1) >= 5:
+                input_states = current_states[:, -5:]
+            else:
+                input_states = current_states
             
             # Generate next chunk with physics
             outputs = self.forward(
@@ -600,8 +608,7 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
                         first_exceed = exceeds_threshold.nonzero()[0].item()
                         breakdown_cycles[i] = current_cycle + first_exceed
                         has_broken[i] = True
-                        # Set remaining predictions to breakdown value
-                        predictions[i, first_exceed + 1:] = predictions[i, first_exceed]
+                        predictions[i, first_exceed + 1:] = self.breakdown_threshold
                     
                     # Check breakdown probability
                     high_prob = breakdown_prob[i] >= breakdown_threshold
@@ -609,7 +616,7 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
                         first_high_prob = high_prob.nonzero()[0].item()
                         breakdown_cycles[i] = current_cycle + first_high_prob
                         has_broken[i] = True
-                        predictions[i, first_high_prob + 1:] = predictions[i, first_high_prob]
+                        predictions[i, first_high_prob + 1:] = self.breakdown_threshold
                     
             trajectories.append(predictions)
             current_states = torch.cat([current_states, predictions], dim=1)
@@ -619,12 +626,10 @@ class PhysicsInformedFerroelectricSurrogate(nn.Module):
         full_trajectory = torch.cat(trajectories, dim=1)
         
         # Get final defect counts
-        final_defect_counts = []
-        for i in range(batch_size):
-            cycle_idx = min(breakdown_cycles[i].item(), full_trajectory.size(1) - 1)
-            final_defect_counts.append(full_trajectory[i, cycle_idx])
-        
-        final_defect_counts = torch.stack(final_defect_counts)
+        final_defect_counts = torch.gather(
+            full_trajectory, 1, 
+            breakdown_cycles.unsqueeze(1).clamp(max=full_trajectory.size(1) - 1)
+        ).squeeze(1)
         
         return {
             'full_trajectory': full_trajectory,
